@@ -148,7 +148,30 @@ for (const sql of [
   'ALTER TABLE orders ADD COLUMN qris_msgid INTEGER DEFAULT 0',
   'ALTER TABLE topups ADD COLUMN qris_chat TEXT DEFAULT \'\'',
   'ALTER TABLE topups ADD COLUMN qris_msgid INTEGER DEFAULT 0',
+  'ALTER TABLE products ADD COLUMN tos_text TEXT',
 ]) { try { db.exec(sql); } catch (e) {} }
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS product_agreements (
+  user_id INTEGER NOT NULL,
+  product_id TEXT NOT NULL,
+  agreed_at TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, product_id)
+);
+`);
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS otp_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id TEXT,
+  user_id INTEGER,
+  last4 TEXT,
+  code TEXT,
+  message TEXT,
+  matched INTEGER DEFAULT 0,
+  received_at TEXT DEFAULT (datetime('now'))
+);
+`);
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS partners (

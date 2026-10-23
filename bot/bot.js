@@ -369,6 +369,7 @@ async function showProducts(ctx, catId, page = 1) {
       else vccNote = `ℹ️ <i>Kartu dikirim otomatis ke chat (nomor, berlaku, CVV) tepat setelah pembayaran.</i>`;
     }
   }
+  if (vccNote) vccNote += `\n🔐 <i>Kode OTP (Visa Secure) saat kamu memakai kartu akan dikirim otomatis ke chat ini.</i>`;
   const pages = Math.max(1, Math.ceil(prods.length / LIST_PAGE));
   page = Math.min(Math.max(1, Number(page) || 1), pages);
   const slice = prods.slice((page - 1) * LIST_PAGE, page * LIST_PAGE);
@@ -405,7 +406,7 @@ async function renderProduct(ctx, p, qty, page = 1) {
   if (flash) info.push(`${E.tag} Harga normal ─ <s>${rp(p.price)}</s> ${E.bolt} Flash sale!`);
   info.push(`${E.package} Stok ─ ${stokTxt}`);
   if (sold > 0) info.push(`${E.star} Terjual ─ ${sold}`);
-  const text = `${divider('sparkle')}\n\n${E.bag} <b>${esc(p.name.toUpperCase())}</b>\n\n${box(info)}\n\n${esc(p.description || '')}\n\nJumlah: <b>${qty}</b> ─ Subtotal <b>${rp(unit * qty)}</b>\n\n${divider('sparkle')}`;
+  const text = `${divider('sparkle')}\n\n${E.bag} <b>${esc(p.name.toUpperCase())}</b>\n\n${box(info)}\n\n${esc(p.description || '')}${p.type === 'vcc' ? `\n\n🔐 <b>OTP Otomatis</b> — kalau saat memakai kartu ini kamu diminta kode OTP (Visa Secure), kodenya akan <b>dikirim otomatis ke chat ini</b>. Tidak perlu tanya admin.` : ''}\n\nJumlah: <b>${qty}</b> ─ Subtotal <b>${rp(unit * qty)}</b>\n\n${divider('sparkle')}`;
   const kb = [
     [Markup.button.callback('−', `qty:${p.id}:-1`), Markup.button.callback(`${qty} pcs`, 'noop'), Markup.button.callback('＋', `qty:${p.id}:1`)],
     [Markup.button.callback(flash ? '⚡ Beli Flash Sale' : 'Tambah Keranjang', flash ? `flashbuy:${p.id}` : `addcart:${p.id}`)],
@@ -730,21 +731,41 @@ function coDiscount(uid, amount) {
   return { discount, code };
 }
 
+/* ---- Ketentuan khusus produk (TOS): setujui sekali per produk, selanjutnya diingat ---- */
+function tosRequired(uid, items) {
+  return items.filter(({ p }) => {
+    if (!String(p.tos_text || '').trim()) return false;
+    const row = store.db.prepare('SELECT 1 FROM product_agreements WHERE user_id=? AND product_id=?').get(uid, p.id);
+    return !row;
+  });
+}
+function tosRecord(uid, items) {
+  const ins = store.db.prepare('INSERT OR IGNORE INTO product_agreements(user_id, product_id) VALUES(?,?)');
+  for (const { p } of items) if (String(p.tos_text || '').trim()) ins.run(uid, p.id);
+}
+
 async function showCheckoutConfirm(ctx, pend, edit = true) {
   const uid = ctx.from.id;
   const { items, amount } = coItems(uid, pend);
   if (!items.length) { await ctx.answerCbQuery('Keranjang kosong').catch(() => {}); return showCart(ctx); }
   const { discount, code } = coDiscount(uid, amount);
   const total = Math.max(amount - discount, 1000);
+  const tosItems = tosRequired(uid, items);
+  const tosPending = tosItems.length > 0 && !(pend && pend.tosOk);
+  const tosLong = tosItems.some(({ p }) => String(p.tos_text).trim().length > 500);
   const body = [
     ...items.map(({ p, qty, unit }) => `${E.cart} ${esc(p.name)} \u00d7${qty} \u2500 ${rp(unit * qty)}`),
     `${E.money} Subtotal \u2500 ${rp(amount)}`,
     ...(discount ? [`${E.tag} Voucher ${esc(code)} \u2500 -${rp(discount)}`] : []),
     `${E.money} Total Bayar \u2500 <b>${rp(total)}</b>`,
   ];
-  const text = `${divider('sparkle')}\n\n${E.cart} <b>KONFIRMASI PESANAN</b>\n\n${box(body)}\n\n<i>Periksa lagi pesananmu. Punya kode voucher? Pakai dulu sebelum bayar supaya diskonnya kepakai.</i>\n\n${divider('sparkle')}`;
+  const tosSection = tosPending ? `\n\n${tosItems.map(({ p }) => { const t = String(p.tos_text).trim(); return t.length <= 500 ? `📜 <b>Ketentuan — ${esc(p.name)}</b>\n${esc(t)}` : `📜 <b>Ketentuan — ${esc(p.name)}</b>\nProduk ini memiliki Syarat & Ketentuan khusus. Ketuk tombol <b>📜 Baca Ketentuan</b> di bawah untuk membaca isinya sebelum menyetujui.`; }).join('\n\n')}` : '';
+  const text = `${divider('sparkle')}\n\n${E.cart} <b>KONFIRMASI PESANAN</b>\n\n${box(body)}${tosSection}\n\n<i>${tosPending ? 'Produk di atas punya ketentuan khusus — baca dan setujui dulu sebelum bayar ya.' : 'Periksa lagi pesananmu. Punya kode voucher? Pakai dulu sebelum bayar supaya diskonnya kepakai.'}</i>\n\n${divider('sparkle')}`;
   const rows = [
     [Markup.button.callback(`\u2705 Bayar Sekarang \u2500 ${rp(total)}`, 'co_pay')],
+    ...(tosPending && tosLong ? [[Markup.button.callback('📜 Baca Ketentuan', 'co_tos_read')]] : []),
+    ...(tosPending ? [[Markup.button.callback('⬜ Setuju dengan Ketentuan Produk', 'co_tos')]] : []),
+    ...(!tosPending && pend && pend.tosOk ? [[Markup.button.callback('✅ Ketentuan Produk Disetujui', 'co_tos')]] : []),
     discount
       ? [Markup.button.callback('\uD83C\uDFAB Ganti Voucher', 'co_voucher'), Markup.button.callback('\uD83D\uDDD1 Hapus Voucher', 'co_voucher_del')]
       : [Markup.button.callback('\uD83C\uDFAB Pakai Voucher', 'co_voucher')],
@@ -881,6 +902,8 @@ const cardHtml = (cards) =>
     return `💳 <b>Nomor</b> ─ <code>${esc(c.number || c.raw)}</code>\n🗓️ <b>Berlaku</b> ─ <code>${esc(c.exp)}</code>\n🔐 <b>CVV</b> ─ <code>${esc(c.cvv)}</code>`;
   }).join('\n\n');
 
+const VCC_OTP_INFO = `🔐 <b>INFO OTP (Visa Secure)</b>\nKalau saat memakai kartu ini kamu diminta kode OTP, <b>kode OTP akan dikirim otomatis ke chat ini</b> — tunggu saja pesannya masuk, lalu masukkan kodenya di halaman pembayaran. Tidak perlu tanya admin. Ingat: kode berlaku singkat, segera pakai begitu diterima.`;
+
 const idxSuffix = (idx) => (idx === 0 ? '' : `-v${idx}`);
 
 async function fulfillVccItem(bot, orderId, idx, it, p) {
@@ -932,7 +955,7 @@ async function fulfillVccItem(bot, orderId, idx, it, p) {
   const res = await senna.waitForDelivery(externalId);
   if (res.status === 'COMPLETED' && res.items && res.items.length) {
     store.markVccState(orderId, 'done');
-    return { userText: `${label}\n${cardHtml(res.items)}` };
+    return { userText: `${label}\n${cardHtml(res.items)}\n\n${VCC_OTP_INFO}` };
   }
   if (res.status === 'FAILED') {
     store.markVccState(orderId, 'failed');
@@ -966,7 +989,7 @@ function scheduleVccRetry(bot, orderId, externalId, it) {
         store.markVccState(orderId, 'done');
         const body = `<b>${esc(it.product_name)} ×${it.qty}</b>\n${cardHtml(res.items)}`;
         store.db.prepare(`UPDATE orders SET delivered_content = CASE WHEN delivered_content IS NULL OR delivered_content='' THEN ? ELSE delivered_content || char(10) || ? END WHERE order_id=?`).run(body, body, orderId);
-        if (o) bot.telegram.sendMessage(o.user_id, `✨ <b>KARTU ANDA SUDAH TERBIT</b>\n\n${E.ticket} No. Order ─ <code>${esc(orderId)}</code>\n\n${body}`, { parse_mode: 'HTML' }).catch(() => {});
+        if (o) bot.telegram.sendMessage(o.user_id, `✨ <b>KARTU ANDA SUDAH TERBIT</b>\n\n${E.ticket} No. Order ─ <code>${esc(orderId)}</code>\n\n${body}\n\n${VCC_OTP_INFO}`, { parse_mode: 'HTML' }).catch(() => {});
         for (const aid of ADMIN_IDS) bot.telegram.sendMessage(aid, `${E.check} VCC <code>${orderId}</code> terbit sukses (retry otomatis).`, { parse_mode: 'HTML' }).catch(() => {});
         return;
       }
@@ -994,7 +1017,7 @@ function scheduleVccCreateRetry(bot, orderId, externalId, it, p, purpose) {
     store.markVccState(orderId, 'done');
     const body = `${label}\n${cardHtml(res.items)}`;
     store.db.prepare(`UPDATE orders SET delivered_content = CASE WHEN delivered_content IS NULL OR delivered_content='' THEN ? ELSE delivered_content || char(10) || ? END WHERE order_id=?`).run(body, body, orderId);
-    if (o) bot.telegram.sendMessage(o.user_id, `✨ <b>KARTU ANDA SUDAH TERBIT</b>\n\n${E.ticket} No. Order ─ <code>${esc(orderId)}</code>\n\n${body}`, { parse_mode: 'HTML' }).catch(() => {});
+    if (o) bot.telegram.sendMessage(o.user_id, `✨ <b>KARTU ANDA SUDAH TERBIT</b>\n\n${E.ticket} No. Order ─ <code>${esc(orderId)}</code>\n\n${body}\n\n${VCC_OTP_INFO}`, { parse_mode: 'HTML' }).catch(() => {});
     for (const aid of ADMIN_IDS) bot.telegram.sendMessage(aid, `${E.check} VCC <code>${orderId}</code> akhirnya terbit (retry deposit).`, { parse_mode: 'HTML' }).catch(() => {});
   };
   const tick = async () => {
@@ -1508,10 +1531,47 @@ Of order tiket, tap me: ${shopBotLink()}`);
     const uid = ctx.from.id;
     const pend = checkoutPending.get(uid);
     if (!pend) { await ctx.answerCbQuery('Sesi checkout sudah berakhir — ulangi dari katalog ya.').catch(() => {}); return; }
+    if (!pend.tosOk) {
+      const { items: coIt } = coItems(uid, pend);
+      if (tosRequired(uid, coIt).length) {
+        await ctx.answerCbQuery('Setujui dulu ketentuan produknya ya 🙏', true).catch(() => {});
+        return showCheckoutConfirm(ctx, pend);
+      }
+    }
     checkoutPending.delete(uid);
     await ctx.answerCbQuery().catch(() => {});
     await ctx.editMessageText('⏳ Membuat pembayaran…').catch(() => {});
     await createOrderFromCart(ctx, pend.singleProd || null, pend.singleQty || 1, pend.priceOverride || null);
+  });
+  bot.action('co_tos', async (ctx) => {
+    const uid = ctx.from.id;
+    const pend = checkoutPending.get(uid);
+    if (!pend) { await ctx.answerCbQuery('Sesi checkout sudah berakhir').catch(() => {}); return; }
+    const { items } = coItems(uid, pend);
+    tosRecord(uid, items);
+    pend.tosOk = true;
+    await ctx.answerCbQuery('✅ Ketentuan disetujui — terima kasih!').catch(() => {});
+    return showCheckoutConfirm(ctx, pend);
+  });
+  bot.action('co_tos_read', async (ctx) => {
+    const uid = ctx.from.id;
+    const pend = checkoutPending.get(uid);
+    if (!pend) { await ctx.answerCbQuery('Sesi checkout sudah berakhir').catch(() => {}); return; }
+    const { items } = coItems(uid, pend);
+    const req = tosRequired(uid, items);
+    const list = req.length ? req : items.filter(({ p }) => String(p.tos_text || '').trim());
+    if (!list.length) { await ctx.answerCbQuery('Tidak ada ketentuan khusus').catch(() => {}); return; }
+    await ctx.answerCbQuery().catch(() => {});
+    const NL2 = String.fromCharCode(10, 10);
+    const full = list.map(({ p }) => '📜 <b>SYARAT & KETENTUAN — ' + esc(p.name) + '</b>' + NL2 + esc(String(p.tos_text).trim())).join(NL2 + '━━━━━━━━━━━━━━' + NL2);
+    const chunks = [];
+    let buf = '';
+    for (const part of full.split(NL2)) { if ((buf + NL2 + part).length > 3500 && buf) { chunks.push(buf); buf = part; } else buf = buf ? buf + NL2 + part : part; }
+    if (buf) chunks.push(buf);
+    for (let i = 0; i < chunks.length; i++) {
+      const last = i === chunks.length - 1;
+      await ctx.reply(chunks[i], { parse_mode: 'HTML', ...(last ? Markup.inlineKeyboard([[Markup.button.callback('✅ Saya Setuju', 'co_tos')], [Markup.button.callback('‹ Kembali ke Konfirmasi', 'co_back')]]) : {}) }).catch(() => {});
+    }
   });
   bot.action('co_voucher', (ctx) => {
     ctx.answerCbQuery().catch(() => {});

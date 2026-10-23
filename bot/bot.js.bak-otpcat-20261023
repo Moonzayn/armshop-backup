@@ -1,0 +1,1978 @@
+const { Telegraf, Markup } = require('telegraf');
+const store = require('./db');
+const qris = require('./qris');
+const notify = require('./notify');
+const senna = require('./senna');
+const vccwatch = require('./vccwatch');
+
+// link bot resmi untuk banner channel (dipilih getMe saat bot start; bisa dioverride env SHOP_TG_LINK)
+let SHOP_BOT_LINK = process.env.SHOP_TG_LINK || null;
+function shopBotLink() { return SHOP_BOT_LINK || 'https://t.me/lacukbot'; }
+let adsIdx = 0;
+
+const SHOP = () => store.getSetting('shop_name', 'La Cukai Shop');
+const TAGLINE = () => store.getSetting('shop_tagline', '');
+const CHANNEL_URL = () => (store.getSetting('channel_url', '') || '').trim();
+
+// ---- gate channel (wajib join sebelum checkout) ----
+const GATE_CH_ID = () => store.getSetting('gate_channel_id', '-1004334380234');
+const GATE_CH_URL = () => store.getSetting('gate_channel_url', 'https://t.me/+7k-ttlDu8BJlYWVl');
+const GROUP_URL = () => store.getSetting('group_url', 'https://t.me/lacukai');
+const gatePending = new Map();
+async function channelMember(telegram, uid) {
+  try {
+    const m = await telegram.getChatMember(GATE_CH_ID(), uid);
+    return ['creator', 'administrator', 'member'].includes(m.status) || (m.status === 'restricted' && !!m.is_member);
+  } catch (e) { return false; }
+}
+
+// ─── gate entry: wajib join channel sebelum pakai bot ───
+const GATE_NOW = () => store.getSetting('gate_entry', '1') === '1';
+
+const joinGateText = () => [
+  '🔒 <b>AKSES TERKUNCI — WAJIB JOIN CHANNEL</b>',
+  '',
+  'Bot ini bisa dipakai <b>setelah kamu join channel resmi kami</b> dulu ya.',
+  '',
+  '📢 Di channel kamu dapat: <b>info restock, flash sale, kode voucher & promo member</b>. Jangan sampai ketinggalan! 🔔',
+  '',
+  'Sudah join? Ketuk <b>✅ Sudah Join — Cek Lagi</b> di bawah.',
+].join('\n');
+const joinGateKb = () => Markup.inlineKeyboard([
+  [Markup.button.url('📢 Join Channel', GATE_CH_URL())],
+  [Markup.button.callback('✅ Sudah Join — Cek Lagi', 'gate_recheck')],
+]);
+
+// untuk /start dan perintah lain (kirim pesan baru)
+async function entryGate(ctx) {
+  const uid = ctx.from.id;
+  if (!GATE_NOW() || ADMIN_IDS.includes(uid)) return true;
+  if (await channelMember(ctx.telegram, uid)) return true;
+  const t = joinGateText();
+  await ctx.reply(t, { parse_mode: 'HTML', ...joinGateKb() }).catch(() => {});
+  return false;
+}
+
+// untuk handler berbasis tombol (edit pesan yang ada)
+async function entryGateInline(ctx) {
+  const uid = ctx.from.id;
+  if (!GATE_NOW() || ADMIN_IDS.includes(uid)) return true;
+  if (await channelMember(ctx.telegram, uid)) return true;
+  await ctx.answerCbQuery('🔒 Kamu belum join channel!').catch(() => {});
+  const t = joinGateText();
+  const edited = await ctx.editMessageText(t, { parse_mode: 'HTML', ...joinGateKb() }).then(() => true).catch(() => false);
+  if (!edited) await ctx.reply(t, { parse_mode: 'HTML', ...joinGateKb() }).catch(() => {});
+  return false;
+}
+
+const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(s => Number(s.trim())).filter(Boolean);
+const EXP_MIN = Number(process.env.INVOICE_EXPIRE_MINUTES || store.getSetting('invoice_expire_minutes', '60')) || 60;
+
+const rp = n => 'Rp' + Number(n || 0).toLocaleString('id-ID');
+const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const isAdmin = (ctx) => ADMIN_IDS.includes(ctx.from.id) || store.isAdmin(ctx.from.id);
+
+// ---- Senna VCC helpers ----
+async function attachSennaStock(list) {
+  if (!list.some(p => p.type === 'vcc') || !senna.enabled()) return list;
+  let cat;
+  try { cat = await senna.catalog(); } catch (e) { return list; }
+  for (const p of list) {
+    if (p.type === 'vcc') {
+      const sp = cat.find(s => s.id === p.senna_product_id);
+      p.senna_stok = sp ? sp.stock : null;
+      p.senna_price = sp ? sp.price : null;
+    }
+  }
+  return list;
+}
+
+// layar penolakan pembelian VCC (muncul sebagai pesan, bukan popup yang hilang)
+async function vccBlock(ctx, p, qty, judul, isi) {
+  const back = [
+    [Markup.button.callback('🔄 Coba Lagi', `buy:${p.id}`)],
+    [Markup.button.callback('‹ Menu Utama', 'menu')],
+  ];
+  try { viewQty.set(ctx.from.id, { prodId: p.id, qty, page: 1 }); } catch (e) {}
+  const text = `${divider('single')}\n\n${judul}\n\n<i>${esc(isi)}</i>\n\n${divider('single')}`;
+  await ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(back) }).catch(async (e) => {
+    await ctx.reply(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(back) }).catch(() => {});
+  });
+}
+const stokLabel = (p) => {
+  if (p.type === 'vcc') {
+    if (p.senna_stok == null) return `⏳ Menunggu stok — kartu terbit otomatis`;
+    if (p.senna_stok > 0) return `${p.senna_stok} ${E.green} tersedia`;
+    return `⏳ Menunggu stok — kartu terbit otomatis begitu tersedia`;
+  }
+  if (p.type === 'digital') return p.stock_n > 0 ? `${p.stock_n} ${E.green} tersedia` : `${E.red} Habis`;
+  return `${E.blue} Layanan`;
+};
+
+// ══════════════════════════════════════════
+// 🎨 DESIGN SYSTEM
+// ══════════════════════════════════════════
+const E = {
+  logo: '💎', crown: '👑', star: '⭐', fire: '🔥', spark: '✨', diamond: '💠',
+  gem: '💎', money: '💰', card: '💳', cart: '🛒', bag: '🛍️', check: '✅',
+  cross: '❌', arrow: '➤', dot: '•', line: '━', wave: '〰️', rocket: '🚀',
+  lock: '🔐', key: '🔑', gift: '🎁', trophy: '🏆', medal: '🎖️', bolt: '⚡',
+  heart: '❤️', blue: '🔵', green: '🟢', red: '🔴', clock: '⏰', cal: '📅',
+  user: '👤', users: '👥', headphone: '🎧', tv: '📺', film: '🎬', game: '🎮',
+  shield: '🛡️', cloud: '☁️', inbox: '📩', pin: '📌', bell: '🔔', back: '◀️',
+  next: '▶️', up: '🔼', home: '🏠', info: 'ℹ️', warn: '⚠️', phone: '📱',
+  laptop: '💻', link: '🔗', search: '🔍', tools: '🔧', package: '📦',
+  ticket: '🎫', percent: '💯', thumb: '👍', hands: '🤝', pray: '🙏',
+  cool: '😎', wink: '😉', party: '🎉', confetti: '🎊', ribbon: '🎀', tag: '🏷️',
+};
+
+const DIV = '━'.repeat(22);
+
+function divider(style = 'sparkle') {
+  const dividers = {
+    sparkle: '✨' + '━'.repeat(20) + '✨',
+    double: '═'.repeat(25),
+    single: '─'.repeat(25),
+    dot: '• • • • • • • • • • • • • • •',
+    wave: '〰️'.repeat(14),
+    star: '✦ '.repeat(13),
+  };
+  return dividers[style] || dividers.sparkle;
+}
+
+function box(lines) {
+  return `┌${'─'.repeat(28)}\n` + lines.map(l => `│ ${l}`).join('\n') + `\n└${'─'.repeat(28)}`;
+}
+
+function progressBar(current, total, length = 10) {
+  const filled = Math.max(0, Math.min(length, Math.round((current / total) * length)));
+  return '█'.repeat(filled) + '░'.repeat(length - filled);
+}
+
+function getGreeting() {
+  let h;
+  try {
+    h = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Jakarta', hour: '2-digit', hourCycle: 'h23' }).format(new Date()));
+  } catch (e) { h = (new Date().getUTCHours() + 7) % 24; }
+  if (h >= 5 && h < 12) return '🌅 Selamat Pagi';
+  if (h >= 12 && h < 15) return '☀️ Selamat Siang';
+  if (h >= 15 && h < 18) return '🌤️ Selamat Sore';
+  return '🌙 Selamat Malam';
+}
+
+function fmtCountdown(ms) {
+  if (ms <= 0) return '00:00:00';
+  const s = Math.floor(ms / 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  if (s >= 86400) return `${Math.floor(s / 86400)}h ${pad(Math.floor(s % 86400 / 3600))}m`;
+  return `${pad(Math.floor(s / 3600))}:${pad(Math.floor(s % 3600 / 60))}:${pad(s % 60)}`;
+}
+
+function discountPct(oldP, newP) {
+  if (!oldP || oldP <= newP) return 0;
+  return Math.round((1 - newP / oldP) * 100);
+}
+
+// ─── data helpers ───
+function trustStats() {
+  const users = store.db.prepare('SELECT COUNT(*) c FROM users').get().c;
+  const paid = store.db.prepare("SELECT COUNT(*) c FROM orders WHERE status='paid'").get().c;
+  let voucher = null;
+  try { voucher = store.db.prepare("SELECT code FROM vouchers WHERE is_active=1 AND (quota=0 OR used<quota) ORDER BY id DESC LIMIT 1").get(); } catch (e) {}
+  return { users, paid, voucher };
+}
+
+function soldCount(pid) {
+  return store.db.prepare(`SELECT COALESCE(SUM(oi.qty),0) v FROM order_items oi
+    JOIN orders o ON o.order_id=oi.order_id
+    WHERE o.status='paid' AND oi.product_id=?`).get(pid).v;
+}
+
+function memberTier(paidN) {
+  const tiers = [
+    { min: 0, icon: '🥉', name: 'Bronze', benefit: '-' },
+    { min: 3, icon: '🥈', name: 'Silver', benefit: 'Diskon ekstra 5%' },
+    { min: 5, icon: '🥇', name: 'Gold', benefit: 'Diskon ekstra 10%' },
+    { min: 10, icon: '👑', name: 'Diamond', benefit: 'Diskon ekstra 15% + prioritas' },
+  ];
+  let idx = 0;
+  for (let i = 0; i < tiers.length; i++) if (paidN >= tiers[i].min) idx = i;
+  const cur = tiers[idx];
+  const next = tiers[idx + 1] || null;
+  const progress = next ? Math.min(100, Math.round(((paidN - cur.min) / (next.min - cur.min)) * 100)) : 100;
+  return { cur, next, progress };
+}
+
+function stepsBlock(status) {
+  const states = {
+    pending: ['done', 'active', 'todo', 'todo'],
+    paid: ['done', 'done', 'done', 'done'],
+    expired: ['done', 'fail', 'todo', 'todo'],
+    cancelled: ['done', 'fail', 'todo', 'todo'],
+  };
+  let labels = ['Order dibuat', 'Menunggu pembayaran (QRIS)', 'Pembayaran diverifikasi', 'Produk dikirim'];
+  if (status === 'expired') labels = ['Order dibuat', 'Pembayaran kadaluarsa', 'Pembayaran diverifikasi', 'Produk dikirim'];
+  if (status === 'cancelled') labels = ['Order dibuat', 'Pesanan dibatalkan', 'Pembayaran diverifikasi', 'Produk dikirim'];
+  const marks = { done: '✅', active: '⏳', todo: '⬜', fail: '❌' };
+  const nums = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'];
+  const st = states[status] || states.pending;
+  const done = st.filter(s => s === 'done').length;
+  const lines = st.map((s, i) => {
+    const prefix = i === st.length - 1 ? '└' : '├';
+    const label = s === 'active' ? `<b>${labels[i]}</b>` : labels[i];
+    return `${prefix} ${nums[i]} ${marks[s]} ${label}`;
+  }).join('\n');
+  return { bar: progressBar(done, st.length, 15), lines, done, total: st.length };
+}
+
+// ─── flash sale config (settings JSON) ───
+function readFlashCfg() {
+  try {
+    const c = JSON.parse(store.getSetting('flash_sale', '') || '');
+    return c && typeof c === 'object' ? c : null;
+  } catch (e) { return null; }
+}
+function getFlash() {
+  const c = readFlashCfg();
+  if (!c || !c.active || !c.ends_at || !c.items) return null;
+  if (c.starts_at && new Date(c.starts_at).getTime() > Date.now()) return null;
+  if (new Date(c.ends_at).getTime() <= Date.now()) return null;
+  if (!Object.keys(c.items).length) return null;
+  return c;
+}
+function flashPriceOf(pid) {
+  const f = getFlash();
+  return f && f.items[pid] ? Number(f.items[pid]) : 0;
+}
+function writeFlash(cfg) { store.setSetting('flash_sale', JSON.stringify(cfg)); }
+
+// ══════════════════════════════════════════
+// 🗄️ ORDER & USER STATE
+// ══════════════════════════════════════════
+const carts = new Map();      // userId -> Map(productId -> qty)
+const viewQty = new Map();    // userId -> {prodId, qty, page}
+const inputState = new Map(); // userId -> {mode, data}
+const searchCache = new Map(); // sid -> {t, q, res}
+const getCart = (uid) => { if (!carts.has(uid)) carts.set(uid, new Map()); return carts.get(uid); };
+const cartCount = (uid) => [...getCart(uid).values()].reduce((a, b) => a + b, 0);
+
+const STATUS_EMOJI = { pending: '\u23F3', paid: '\u2705', expired: '\u231B', cancelled: '\u274C' };
+const STATUS_LABEL = { pending: 'Menunggu Bayar', paid: 'Lunas', expired: 'Kadaluarsa', cancelled: 'Dibatalkan' };
+
+// ══════════════════════════════════════════
+// ⌨️ KEYBOARDS
+// ══════════════════════════════════════════
+const mainMenu = (uid) => {
+  const rows = [
+    [Markup.button.callback(`${E.bag} 𝗣𝗿𝗼𝗱𝘂𝗸 𝗣𝗿𝗲𝗺𝗶𝘂𝗺`, 'cats'), Markup.button.callback(`${E.search} 𝗖𝗮𝗿𝗶`, 'search')],
+    [Markup.button.callback(`${E.cart} 𝗞𝗲𝗿𝗮𝗻𝗷𝗮𝗻𝗴 (${cartCount(uid)})`, 'cart'), Markup.button.callback(`${E.package} 𝗣𝗲𝘀𝗮𝗻𝗮𝗻 𝗦𝗮𝘆𝗮`, 'orders')],
+  ];
+  const mid = [];
+  if (getFlash()) mid.push(Markup.button.callback(`${E.bolt} 𝗙𝗹𝗮𝘀𝗵 𝗦𝗮𝗹𝗲`, 'menu_flash'));
+  mid.push(Markup.button.callback(`${E.money} 𝗦𝗮𝗹𝗱𝗼`, 'menu_saldo'));
+  mid.push(Markup.button.callback(`${E.trophy} 𝗧𝗲𝘀𝘁𝗶𝗺𝗼𝗻𝗶`, 'menu_testimoni'));
+  rows.push(mid);
+  rows.push([
+    Markup.button.callback(`${E.spark} 𝗔𝗽𝗽𝘀 𝗣𝗿𝗲𝗺𝗶𝘂𝗺`, 'menu_partners'),
+    Markup.button.callback(`${E.info} 𝗦𝗡𝗞`, 'menu_snk'),
+  ]);
+  rows.push([
+    Markup.button.callback(`${E.user} 𝗣𝗿𝗼𝗳𝗶𝗹`, 'menu_profil'),
+    Markup.button.callback(`${E.info} 𝗕𝗮𝗻𝘁𝘂𝗮𝗻`, 'cs'),
+  ]);
+  const ch = CHANNEL_URL();
+  if (ch) rows.push([Markup.button.url(`${E.bell} 𝗝𝗼𝗶𝗻 𝗖𝗵𝗮𝗻𝗻𝗲𝗹`, ch)]);
+  return Markup.inlineKeyboard(rows);
+};
+const backMenu = Markup.inlineKeyboard([[Markup.button.callback('‹ Menu Utama', 'menu')]]);
+const backCats = Markup.inlineKeyboard([[Markup.button.callback('‹ Kembali', 'cats')]]);
+
+const LIST_PAGE = 8;   // produk per halaman (2 kolom → 4 baris)
+const ORDERS_PAGE = 6; // riwayat pesanan per halaman
+const TESTI_PAGE = 6;  // testimoni per halaman
+const FLASH_PAGE = 6;  // item flash sale per halaman
+
+function pageNav(base, page, pages) {
+  if (pages <= 1) return [];
+  const r = [];
+  r.push(Markup.button.callback(page > 1 ? '‹' : '‹', page > 1 ? `${base}:${page - 1}` : 'noop'));
+  r.push(Markup.button.callback(`📄 ${page}/${pages}`, 'noop'));
+  r.push(Markup.button.callback('›', page < pages ? `${base}:${page + 1}` : 'noop'));
+  return [r];
+}
+
+// ══════════════════════════════════════════
+// 🏠 START / MAIN MENU
+// ══════════════════════════════════════════
+async function showMenu(ctx, edit = true) {
+  const st = trustStats();
+  const lines = [
+    divider('sparkle'),
+    '',
+    `     ${E.logo} <b>${esc(SHOP().toUpperCase())}</b> ${E.logo}`,
+    '',
+    divider('sparkle'),
+    '',
+    `${getGreeting()}, <b>${esc(ctx.from.first_name || 'Customer')}</b>! ${E.wink}`,
+    '',
+    String(store.getSetting('welcome_text', '') || `Selamat datang di <b>${esc(SHOP())}</b> ${E.gem}\n${esc(TAGLINE())}`)
+      .replace(/{shop}/g, esc(SHOP())).replace(/{tagline}/g, esc(TAGLINE())),
+    '',
+    `${E.check} Bayar QRIS otomatis — produk langsung dikirim`,
+    `${E.check} Garansi full replacement`,
+    `${E.check} Support fast response`,
+    `${E.check} <b>${st.users}</b> pelanggan · <b>${st.paid}</b> pesanan selesai`,
+  ];
+  if (st.voucher) {
+    lines.push('', divider('dot'), '', `${E.fire} <b>PROMO!</b> Pakai kode <code>${esc(st.voucher.code)}</code> di keranjang! ${E.gift}`);
+  }
+  lines.push('', divider('dot'), '', `${E.arrow} Pilih menu di bawah untuk mulai belanja! ${E.cart}`, '', divider('sparkle'));
+  const text = lines.join('\n');
+  if (edit) { try { return await ctx.editMessageText(text, { parse_mode: 'HTML', ...mainMenu(ctx.from.id) }); } catch (e) {} }
+  return ctx.reply(text, { parse_mode: 'HTML', ...mainMenu(ctx.from.id) });
+}
+
+// ══════════════════════════════════════════
+// 📦 CATALOG
+// ══════════════════════════════════════════
+async function showCats(ctx) {
+  const cats = store.categories(true);
+  if (!cats.length) return ctx.editMessageText('📭 Katalog masih kosong.', { parse_mode: 'HTML', ...backMenu });
+  const rows = [];
+  for (let i = 0; i < cats.length; i += 2) {
+    const r = [Markup.button.callback(cats[i].name, `cat:${cats[i].id}`)];
+    if (cats[i + 1]) r.push(Markup.button.callback(cats[i + 1].name, `cat:${cats[i + 1].id}`));
+    rows.push(r);
+  }
+  rows.push([Markup.button.callback('‹ Menu Utama', 'menu')]);
+  const text = `${divider('sparkle')}\n\n${E.bag} <b>KATALOG PRODUK</b>\n${DIV}\n\nPilih kategori yang Anda minati${E.cool}:\n\n${divider('sparkle')}`;
+  try { await ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }); }
+  catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }); }
+}
+
+async function showProducts(ctx, catId, page = 1) {
+  let prods = store.productsByCat(catId);
+  await attachSennaStock(prods);
+  const cat = store.categories().find(c => c.id === catId);
+  const title = cat ? cat.name : 'Katalog';
+  if (!prods.length) return ctx.editMessageText(`📭 Belum ada produk di <b>${esc(title)}</b>.`, { parse_mode: 'HTML', ...backCats });
+  // banner info khusus kategori VCC (tanpa pemblokiran — kartu diterbitkan otomatis saat supplier siap)
+  const hasVcc = prods.some(p => p.type === 'vcc');
+  let vccNote = '';
+  if (hasVcc) {
+    if (!senna.enabled()) {
+      vccNote = `⚠️ <i>Layanan kartu sementara tidak aktif. Pembelian tetap bisa dibuat — kartu diterbitkan otomatis begitu layanan normal kembali.</i>`;
+    } else {
+      const dep = await senna.balance().catch(() => null);
+      if (dep == null) vccNote = `⚠️ <i>Server kartu sedang gangguan. Pembelian tetap bisa dibuat — kartu diterbitkan otomatis begitu server normal.</i>`;
+      else if (dep < 1000) vccNote = `ℹ️ <b>Cara kerja kartu:</b> dibayar → kartu terbit otomatis ke chat.\n⏳ <i>Stok kartu sedang kosong — kartu terbit otomatis begitu stok tersedia kembali (maks. 24 jam, melebihinya direfund).</i>`;
+      else vccNote = `ℹ️ <i>Kartu dikirim otomatis ke chat (nomor, berlaku, CVV) tepat setelah pembayaran.</i>`;
+    }
+  }
+  const pages = Math.max(1, Math.ceil(prods.length / LIST_PAGE));
+  page = Math.min(Math.max(1, Number(page) || 1), pages);
+  const slice = prods.slice((page - 1) * LIST_PAGE, page * LIST_PAGE);
+  const rows = slice.map(p => {
+    const stok = p.type === 'vcc'
+      ? (p.senna_stok == null ? ' · ⏳ menunggu stok' : (p.senna_stok > 0 ? ` · 📦${p.senna_stok}` : ' · ⏳ menunggu stok'))
+      : (p.type === 'digital' ? (p.stock_n > 0 ? ` · 📦${p.stock_n}` : ' · ❌habis') : '');
+    const flash = flashPriceOf(p.id);
+    return [Markup.button.callback(`${flash ? '⚡ ' : ''}${p.name} — ${rp(flash || p.price)}${stok}`, `prod:${p.id}:${page}`)];
+  });
+  rows.push(...pageNav(`cat:${catId}`, page, pages));
+  rows.push([Markup.button.callback('‹ Kembali', 'cats')]);
+  const pageNote = pages > 1 ? `\n${E.package} Halaman <b>${page}</b> dari <b>${pages}</b>` : '';
+  const text = `${divider('sparkle')}\n\n${E.bag} <b>${esc(title.toUpperCase())}</b>\n${DIV}\n\nSentuh produk untuk melihat detail:${pageNote}\n\n${vccNote}\n\n${divider('sparkle')}`;
+  try { await ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }); }
+  catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }); }
+}
+
+async function showProduct(ctx, prodId, page = 1) {
+  const p = store.getProduct(prodId);
+  if (!p) return ctx.answerCbQuery('Produk tidak ditemukan');
+  const uid = ctx.from.id;
+  viewQty.set(uid, { prodId, qty: 1, page });
+  await renderProduct(ctx, p, 1, page);
+}
+
+async function renderProduct(ctx, p, qty, page = 1) {
+  const flash = flashPriceOf(p.id);
+  const unit = flash || p.price;
+  await attachSennaStock([p]);
+  const stokTxt = stokLabel(p);
+  const sold = soldCount(p.id);
+  const info = [`${E.money} Harga ─ <b>${rp(unit)}</b>`];
+  if (flash) info.push(`${E.tag} Harga normal ─ <s>${rp(p.price)}</s> ${E.bolt} Flash sale!`);
+  info.push(`${E.package} Stok ─ ${stokTxt}`);
+  if (sold > 0) info.push(`${E.star} Terjual ─ ${sold}`);
+  const text = `${divider('sparkle')}\n\n${E.bag} <b>${esc(p.name.toUpperCase())}</b>\n\n${box(info)}\n\n${esc(p.description || '')}${p.type === 'vcc' ? `\n\n🔐 <b>OTP Otomatis</b> — kalau saat memakai kartu ini kamu diminta kode OTP (Visa Secure), kodenya akan <b>dikirim otomatis ke chat ini</b>. Tidak perlu tanya admin.` : ''}\n\nJumlah: <b>${qty}</b> ─ Subtotal <b>${rp(unit * qty)}</b>\n\n${divider('sparkle')}`;
+  const kb = [
+    [Markup.button.callback('−', `qty:${p.id}:-1`), Markup.button.callback(`${qty} pcs`, 'noop'), Markup.button.callback('＋', `qty:${p.id}:1`)],
+    [Markup.button.callback(flash ? '⚡ Beli Flash Sale' : 'Tambah Keranjang', flash ? `flashbuy:${p.id}` : `addcart:${p.id}`)],
+    [Markup.button.callback('Beli Sekarang', `buy:${p.id}`)],
+    [Markup.button.callback('‹ Kembali', `cat:${p.category_id}:${page}`)],
+  ];
+  try {
+    const photo = p.photo_url && p.photo_url.startsWith('/') && process.env.PUBLIC_URL
+      ? process.env.PUBLIC_URL.replace(/\/+$/, '') + p.photo_url : p.photo_url;
+    if (photo) {
+      await ctx.deleteMessage().catch(() => {});
+      return await ctx.replyWithPhoto(photo, { caption: text, parse_mode: 'HTML', ...Markup.inlineKeyboard(kb) });
+    }
+    await ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(kb) });
+  } catch (e) { /* ignore edit conflicts */ }
+}
+
+// ══════════════════════════════════════════
+// 🛒 CART
+// ══════════════════════════════════════════
+async function showCart(ctx) {
+  const uid = ctx.from.id;
+  const cart = getCart(uid);
+  if (!cart.size) {
+    return ctx.editMessageText(`${divider('sparkle')}\n\n${E.cart} <b>Keranjang kosong.</b>\n\nYuk belanja dulu 👇\n\n${divider('sparkle')}`,
+      { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🛍️ Lihat Katalog', 'cats')], [Markup.button.callback('‹ Menu Utama', 'menu')]]) });
+  }
+  let total = 0; const rows = []; const lines = [`${E.cart} <b>KERANJANG BELANJA</b>`, ''];
+  for (const [pid, qty] of cart) {
+    const p = store.getProduct(pid);
+    if (!p) continue;
+    const flash = flashPriceOf(pid);
+    const unit = flash || p.price;
+    total += unit * qty;
+    lines.push(box([`${p.name} ×${qty} ─ <b>${rp(unit * qty)}</b>`]));
+    rows.push([Markup.button.callback(`${flash ? '⚡ ' : ''}${p.name} ×${qty} — ${rp(unit * qty)}`, `prod:${pid}`)]);
+    rows.push([
+      Markup.button.callback('−', `cartqty:${pid}:-1`),
+      Markup.button.callback('Hapus', `cartdel:${pid}`),
+      Markup.button.callback('＋', `cartqty:${pid}:1`),
+    ]);
+  }
+  rows.push([Markup.button.callback('✅ Checkout Sekarang', 'checkout')]);
+  rows.push([Markup.button.callback('🎫 Pakai Voucher', 'voucher'), Markup.button.callback('🗑 Kosongkan', 'cartclear')]);
+  rows.push([Markup.button.callback('‹ Menu Utama', 'menu')]);
+  lines.push('', `${E.money} Total Belanja ─ <b>${rp(total)}</b>`, '', divider('sparkle'));
+  const text = lines.join('\n');
+  try { await ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }); }
+  catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }); }
+}
+
+// ══════════════════════════════════════════
+// 📋 ORDERS LIST (paginated)
+// ══════════════════════════════════════════
+async function renderOrders(ctx, page = 1, edit = true) {
+  const send = async (text, kb) => {
+    const opts = { parse_mode: 'HTML', ...Markup.inlineKeyboard(kb) };
+    if (edit) { try { return await ctx.editMessageText(text, opts); } catch (e) {} }
+    return ctx.reply(text, opts);
+  };
+  const orders = store.userOrders(ctx.from.id);
+  if (!orders.length) {
+    return send(`${divider('sparkle')}\n\n${E.package} <b>Belum ada pesanan.</b>\n\nYuk mulai belanja! ${E.bag}\n\n${divider('sparkle')}`,
+      [[Markup.button.callback('‹ Menu Utama', 'menu')]]);
+  }
+  const pages = Math.max(1, Math.ceil(orders.length / ORDERS_PAGE));
+  page = Math.min(Math.max(1, Number(page) || 1), pages);
+  const slice = orders.slice((page - 1) * ORDERS_PAGE, page * ORDERS_PAGE);
+  const rows = slice.map(o => [Markup.button.callback(`${STATUS_EMOJI[o.status] || '•'} ${o.order_id} · ${rp(o.total)}`, `order:${o.order_id}`)]);
+  rows.push(...pageNav('orders', page, pages));
+  rows.push([Markup.button.callback('‹ Menu Utama', 'menu')]);
+  const pageNote = pages > 1 ? `\n${E.package} Halaman <b>${page}</b> dari <b>${pages}</b>` : '';
+  const text = `${divider('sparkle')}\n\n${E.cart} <b>RIWAYAT PESANAN</b>\n${DIV}\n\nSentuh pesanan untuk melihat detail:${pageNote}\n\n${divider('sparkle')}`;
+  return send(text, rows);
+}
+
+// ══════════════════════════════════════════
+// 🔎 SEARCH RESULTS (paginated)
+// ══════════════════════════════════════════
+async function renderSearch(ctx, sid, page = 1, edit = true) {
+  const send = async (text, kb) => {
+    const opts = { parse_mode: 'HTML', ...Markup.inlineKeyboard(kb) };
+    if (edit) { try { return await ctx.editMessageText(text, opts); } catch (e) {} }
+    return ctx.reply(text, opts);
+  };
+  const entry = searchCache.get(sid);
+  if (!entry) {
+    return send(`${E.clock} Pencarian sudah kedaluwarsa.\nSilakan cari ulang ${E.search}`,
+      [[Markup.button.callback('🔎 Cari Lagi', 'search')], [Markup.button.callback('‹ Menu Utama', 'menu')]]);
+  }
+  const { q, res } = entry;
+  const pages = Math.max(1, Math.ceil(res.length / LIST_PAGE));
+  page = Math.min(Math.max(1, Number(page) || 1), pages);
+  const slice = res.slice((page - 1) * LIST_PAGE, page * LIST_PAGE);
+  const rows = slice.map(p => [Markup.button.callback(`${p.name} — ${rp(p.price)}`, `prod:${p.id}`)]);
+  rows.push(...pageNav(`srch:${sid}`, page, pages));
+  rows.push([Markup.button.callback('‹ Menu Utama', 'menu')]);
+  const pageNote = pages > 1 ? `\n${E.package} Halaman <b>${page}</b> dari <b>${pages}</b>` : '';
+  const text = `${E.search} <b>Hasil "${esc(q)}":</b> <i>(${res.length} produk)</i>${pageNote}`;
+  return send(text, rows);
+}
+
+// ══════════════════════════════════════════
+// 💳 CHECKOUT & QRIS PAYMENT
+// ══════════════════════════════════════════
+function makeOrderId() {
+  const d = new Date();
+  const ds = `${String(d.getDate()).padStart(2, '0')}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getFullYear()).slice(2)}`;
+  return `LC-${ds}-${Math.floor(1000 + Math.random() * 9000)}`;
+}
+
+// ══════════════════════════════════════════
+// 💰 WALLET / SALDO
+// ══════════════════════════════════════════
+const TOPUP_PRESETS = [5000, 10000, 25000, 50000, 100000];
+const makeTopupId = () => {
+  const d = new Date();
+  const ds = `${String(d.getDate()).padStart(2, '0')}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getFullYear()).slice(2)}`;
+  return `TP-${ds}-${Math.floor(1000 + Math.random() * 9000)}`;
+};
+
+async function showWallet(ctx) {
+  const uid = ctx.from.id;
+  const bal = store.walletGet(uid);
+  const h = store.walletHistory(uid, 5);
+  const rows = h.map(x => {
+    const sign = x.delta >= 0 ? '+' : '';
+    return `├ ${x.kind === 'topup' ? '🟢' : x.kind === 'refund' ? '🌀' : x.kind === 'use' ? '🔵' : '⚪'} ${esc(x.note || x.kind)} ─ ${sign}${rp(x.delta)}`;
+  });
+  const text = `${divider('sparkle')}\n\n   ${E.money} <b>SALDO SAYA</b>\n\n${box([`${E.gem} Saldo ─ <b>${rp(bal)}</b>`])}\n\n${E.clock} <b>Mutasi Terakhir</b>\n${rows.join('\n') || '├ <i>belum ada mutasi</i>'}\n\n${E.info} <i>Saldo bisa dipakai bayar belanja dan jadi tempat refund otomatis. Tidak dapat dicairkan.</i>\n\n${divider('sparkle')}`;
+  const kb = Markup.inlineKeyboard([
+    [Markup.button.callback('➕ Isi Saldo', 'saldo_topup')],
+    [Markup.button.callback('‹ Menu Utama', 'menu')],
+  ]);
+  try { await ctx.editMessageText(text, { parse_mode: 'HTML', ...kb }); }
+  catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...kb }); }
+}
+
+function showTopupPresets(ctx) {
+  const text = `${divider('sparkle')}\n\n${E.money} <b>ISI SALDO</b>\n${DIV}\n\nPilih nominal isi saldo (min. ${rp(5000)}):\n\n${divider('sparkle')}`;
+  const rows = [];
+  for (let i = 0; i < TOPUP_PRESETS.length; i += 2) {
+    rows.push(TOPUP_PRESETS.slice(i, i + 2).map(v => Markup.button.callback(rp(v), `isaldo:${v}`)));
+  }
+  rows.push([Markup.button.callback('‹ Menu Utama', 'menu')]);
+  const kb = Markup.inlineKeyboard(rows);
+  try { return ctx.editMessageText(text, { parse_mode: 'HTML', ...kb }); }
+  catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...kb }); }
+}
+
+async function createTopup(ctx, uid, amount) {
+  amount = Math.round(Number(amount));
+  if (!amount || amount < 5000) return ctx.reply(`${E.cross} Nominal isi saldo minimal ${rp(5000)}.`, { parse_mode: 'HTML', ...backMenu });
+  if (amount > 2000000) return ctx.reply(`${E.cross} Nominal isi saldo maksimal ${rp(2000000)}.`, { parse_mode: 'HTML', ...backMenu });
+  const topupId = makeTopupId();
+  const publicUrl = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
+  let qd;
+  try {
+    qd = await qris.create({ orderId: topupId, amount, keterangan: `Isi Saldo ${topupId}`.slice(0, 60), callbackUrl: publicUrl ? `${publicUrl}/webhook/qris` : '' });
+  } catch (e) {
+    console.error('[QRIS topup]', e.message);
+    return ctx.reply('❌ Gagal membuat pembayaran isi saldo. Coba lagi sebentar.', { parse_mode: 'HTML', ...backMenu });
+  }
+  const expiredAt = qd.expired_at || new Date(Date.now() + EXP_MIN * 60000).toISOString();
+  store.walletCreateTopup({ topup_id: topupId, user_id: uid, amount, qris_image: '', qris_url: qd.qris_url || '', expired_at: expiredAt, signature: qd.signature || '' });
+  const expTime = new Date(expiredAt).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'short' });
+  const lines = [
+    `${E.money} <b>ISI SALDO</b>`,
+    '',
+    box([
+      `${E.ticket} Nomor ─ <code>${topupId}</code>`,
+      `${E.money} Nominal ─ <b>${rp(qd.total_amount ? Math.round(Number(qd.amount)) : amount)}</b>`,
+      `${E.clock} Berlaku hingga ─ ${expTime} WIB`,
+    ]),
+    '',
+    `${E.info} Setelah saldo masuk, saldo bisa langsung dipakai bayar belanja.`,
+    '',
+    divider('sparkle'),
+  ];
+  const kb = Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Saya Sudah Bayar', `tppaid:${topupId}`)],
+    [Markup.button.callback('❌ Batalkan', `tpcancel:${topupId}`)],
+  ]);
+  let qrBuf = null;
+  try { qrBuf = await qris.qrBuffer(qd.qris_image); } catch (e) {}
+  let sent = null;
+  try {
+    if (qrBuf) sent = await ctx.replyWithPhoto({ source: qrBuf }, { caption: lines.join('\n'), parse_mode: 'HTML', ...kb });
+    else if (qd.qris_url) sent = await ctx.replyWithPhoto(qd.qris_url, { caption: lines.join('\n'), parse_mode: 'HTML', ...kb });
+    else sent = await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', ...kb });
+  } catch (e) { sent = await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', ...kb }); }
+  if (sent) store.setTopupQrisMsg(topupId, ctx.chat && ctx.chat.id, sent.message_id);
+}
+
+// tandai pesan QRIS topup saldo sebagai sudah tidak berlaku + hapus tombolnya
+async function topupMarkClosed(bot, t, title, note) {
+  if (!t || !t.qris_chat || !t.qris_msgid) return;
+  const caption = `${title}\n\n${box([
+    `${E.ticket} Nomor ─ <code>${t.topup_id}</code>`,
+    ...(note ? [`${E.info} ${note}`] : []),
+  ])}\n\n<i>QR di pesan ini tidak sah lagi — jangan dipindai.</i>\n\n${divider('sparkle')}`;
+  try {
+    await bot.telegram.editMessageCaption(t.qris_chat, t.qris_msgid, { caption, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
+  } catch (e) {
+    try { await bot.telegram.editMessageReplyMarkup(t.qris_chat, t.qris_msgid); } catch (e2) {}
+  }
+}
+
+async function topupPaid(ctx, topupId) {
+  const t = store.walletGetTopup(topupId);
+  if (!t) return ctx.answerCbQuery('Topup tidak ditemukan', true).catch(() => {});
+  try {
+    const d = await qris.status(topupId);
+    const st = String(d.status || '').toUpperCase();
+    if (st === 'PAID' || st === 'SUCCESS' || st === 'SETTLED') {
+      if (store.walletCreditTopup(topupId)) {
+        await ctx.answerCbQuery(`✅ Saldo ${rp(t.amount)} masuk!`).catch(() => {});
+        return showWallet(ctx);
+      }
+      await ctx.answerCbQuery('Sudah diproses sebelumnya').catch(() => {});
+      return;
+    }
+    await ctx.answerCbQuery('⏳ Belum terdeteksi. Tunggu sebentar lalu coba lagi.', true).catch(() => {});
+  } catch (e) {
+    await ctx.answerCbQuery('❌ Gagal cek status. Coba lagi.', true).catch(() => {});
+  }
+}
+
+// refund otomatis dana pembeli VCC ke wallet (dipakai saat kartu kalah / lewat 24 jam)
+async function refundToWallet(bot, orderId, ref, uid, amount, alasan) {
+  try {
+    if (store.walletHasRef(ref)) return false; // sudah pernah diproses
+    store.walletTx(uid, 'refund', Math.round(Number(amount)), ref, `Refund ${orderId} — ${alasan}`);
+    bot.telegram.sendMessage(uid, `${E.money} <b>REFUND MASUK KE SALDO</b>\n\n${box([
+      `${E.ticket} Order ─ <code>${esc(orderId)}</code>`,
+      `${E.money} Nilai ─ <b>+${rp(amount)}</b>`,
+      `${E.info} Alasan ─ ${esc(alasan)}`,
+    ])}\n\n<i>Saldo bisa langsung dipakai belanja lagi. Tidak dapat dicairkan.</i>`, { parse_mode: 'HTML' }).catch(() => {});
+    for (const aid of ADMIN_IDS) bot.telegram.sendMessage(aid, `${E.money} Refund otomatis ${rp(amount)} → saldo user <code>${uid}</code> (order <code>${orderId}</code>).`, { parse_mode: 'HTML' }).catch(() => {});
+    return true;
+  } catch (e) { console.error('[refund]', e.message); return false; }
+}
+
+// kirim ulang pesan QRIS untuk order yang sudah masuk DB (jalur "Bayar via QRIS" dari saldo tetap tersedia)
+async function sendQrisMessage(ctx, o, qd) {
+  const expTime = new Date(o.expired_at).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'short' });
+  const lines = [
+    `${E.card} <b>MENUNGGU PEMBAYARAN</b>`,
+    '',
+    box([
+      `${E.ticket} No. Order ─ <code>${o.order_id}</code>`,
+      `${E.cart} Produk ─ ${esc(o.product_name)}`,
+      `${E.money} Total Bayar ─ <b>${rp(qd.total_amount || o.total)}</b>`,
+      ...(o.discount ? [`${E.tag} Voucher ${esc(o.voucher_code)} ─ -${rp(o.discount)}`] : []),
+      `${E.clock} Berlaku hingga ─ ${expTime} WIB`,
+    ]),
+    '',
+    `${E.info} Pindai kode QR di atas menggunakan aplikasi pembayaran apa pun.`,
+    '',
+    `${E.arrow} Setelah pembayaran berhasil, sentuh tombol di bawah.`,
+    '',
+    divider('sparkle'),
+  ];
+  const kb = Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Saya Sudah Bayar', `paid:${o.order_id}`)],
+    [Markup.button.callback('❌ Batalkan Pesanan', `cancel:${o.order_id}`)],
+  ]);
+  let qrBuf = null;
+  try { qrBuf = await qris.qrBuffer(qd.qris_image); } catch (e) {}
+  let sent = null;
+  try {
+    if (qrBuf) sent = await ctx.replyWithPhoto({ source: qrBuf }, { caption: lines.join('\n'), parse_mode: 'HTML', ...kb });
+    else if (qd.qris_url || o.qris_url) sent = await ctx.replyWithPhoto(qd.qris_url || o.qris_url, { caption: lines.join('\n'), parse_mode: 'HTML', ...kb });
+    else sent = await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', ...kb });
+  } catch (e) { sent = await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', ...kb }); }
+  if (sent && o.order_id) store.setOrderQrisMsg(o.order_id, ctx.chat && ctx.chat.id, sent.message_id);
+}
+
+// tandai pesan QRIS (foto/kode) sebagai sudah tidak berlaku + hapus tombolnya
+async function qrisMarkClosed(bot, order, title, note) {
+  if (!order || !order.qris_chat || !order.qris_msgid) return;
+  const caption = `${title}\n\n${box([
+    `${E.ticket} No. Order ─ <code>${order.order_id}</code>`,
+    ...(note ? [`${E.info} ${note}`] : []),
+  ])}\n\n<i>QR di pesan ini tidak sah lagi — jangan dipindai.</i>\n\n${divider('sparkle')}`;
+  try {
+    await bot.telegram.editMessageCaption(order.qris_chat, order.qris_msgid, { caption, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
+  } catch (e) {
+    try { await bot.telegram.editMessageReplyMarkup(order.qris_chat, order.qris_msgid); } catch (e2) {}
+  }
+}
+
+
+/* ---- Konfirmasi checkout: opsi voucher juga di layar beli (bukan cuma keranjang) ---- */
+const checkoutPending = new Map(); // uid -> { singleProd, singleQty, priceOverride }
+
+function coItems(uid, pend) {
+  const items = [];
+  if (pend && pend.singleProd) {
+    const p = store.getProduct(pend.singleProd);
+    if (p) items.push({ p, qty: pend.singleQty || 1, unit: pend.priceOverride || flashPriceOf(pend.singleProd) || p.price });
+  } else {
+    for (const [pid, qty] of getCart(uid)) {
+      const p = store.getProduct(pid);
+      if (p) items.push({ p, qty, unit: flashPriceOf(pid) || p.price });
+    }
+  }
+  const amount = items.reduce((a, { qty, unit }) => a + unit * qty, 0);
+  return { items, amount };
+}
+
+function coDiscount(uid, amount) {
+  const st = inputState.get(uid);
+  let discount = 0, code = '';
+  if (st && st.mode === 'voucher_ok' && st.data) {
+    const v = store.getVoucher(st.data.code);
+    if (v && (!v.quota || v.used < v.quota) && amount >= (v.min_amount || 0)) {
+      discount = v.kind === 'percent' ? Math.round(amount * v.value / 100) : Math.min(v.value, amount);
+      code = v.code;
+    }
+  }
+  return { discount, code };
+}
+
+/* ---- Ketentuan khusus produk (TOS): setujui sekali per produk, selanjutnya diingat ---- */
+function tosRequired(uid, items) {
+  return items.filter(({ p }) => {
+    if (!String(p.tos_text || '').trim()) return false;
+    const row = store.db.prepare('SELECT 1 FROM product_agreements WHERE user_id=? AND product_id=?').get(uid, p.id);
+    return !row;
+  });
+}
+function tosRecord(uid, items) {
+  const ins = store.db.prepare('INSERT OR IGNORE INTO product_agreements(user_id, product_id) VALUES(?,?)');
+  for (const { p } of items) if (String(p.tos_text || '').trim()) ins.run(uid, p.id);
+}
+
+async function showCheckoutConfirm(ctx, pend, edit = true) {
+  const uid = ctx.from.id;
+  const { items, amount } = coItems(uid, pend);
+  if (!items.length) { await ctx.answerCbQuery('Keranjang kosong').catch(() => {}); return showCart(ctx); }
+  const { discount, code } = coDiscount(uid, amount);
+  const total = Math.max(amount - discount, 1000);
+  const tosItems = tosRequired(uid, items);
+  const tosPending = tosItems.length > 0 && !(pend && pend.tosOk);
+  const tosLong = tosItems.some(({ p }) => String(p.tos_text).trim().length > 500);
+  const body = [
+    ...items.map(({ p, qty, unit }) => `${E.cart} ${esc(p.name)} \u00d7${qty} \u2500 ${rp(unit * qty)}`),
+    `${E.money} Subtotal \u2500 ${rp(amount)}`,
+    ...(discount ? [`${E.tag} Voucher ${esc(code)} \u2500 -${rp(discount)}`] : []),
+    `${E.money} Total Bayar \u2500 <b>${rp(total)}</b>`,
+  ];
+  const tosSection = tosPending ? `\n\n${tosItems.map(({ p }) => { const t = String(p.tos_text).trim(); return t.length <= 500 ? `📜 <b>Ketentuan — ${esc(p.name)}</b>\n${esc(t)}` : `📜 <b>Ketentuan — ${esc(p.name)}</b>\nProduk ini memiliki Syarat & Ketentuan khusus. Ketuk tombol <b>📜 Baca Ketentuan</b> di bawah untuk membaca isinya sebelum menyetujui.`; }).join('\n\n')}` : '';
+  const text = `${divider('sparkle')}\n\n${E.cart} <b>KONFIRMASI PESANAN</b>\n\n${box(body)}${tosSection}\n\n<i>${tosPending ? 'Produk di atas punya ketentuan khusus — baca dan setujui dulu sebelum bayar ya.' : 'Periksa lagi pesananmu. Punya kode voucher? Pakai dulu sebelum bayar supaya diskonnya kepakai.'}</i>\n\n${divider('sparkle')}`;
+  const rows = [
+    [Markup.button.callback(`\u2705 Bayar Sekarang \u2500 ${rp(total)}`, 'co_pay')],
+    ...(tosPending && tosLong ? [[Markup.button.callback('📜 Baca Ketentuan', 'co_tos_read')]] : []),
+    ...(tosPending ? [[Markup.button.callback('⬜ Setuju dengan Ketentuan Produk', 'co_tos')]] : []),
+    ...(!tosPending && pend && pend.tosOk ? [[Markup.button.callback('✅ Ketentuan Produk Disetujui', 'co_tos')]] : []),
+    discount
+      ? [Markup.button.callback('\uD83C\uDFAB Ganti Voucher', 'co_voucher'), Markup.button.callback('\uD83D\uDDD1 Hapus Voucher', 'co_voucher_del')]
+      : [Markup.button.callback('\uD83C\uDFAB Pakai Voucher', 'co_voucher')],
+    [Markup.button.callback('\u2039 Batal', 'co_cancel')],
+  ];
+  const kb = Markup.inlineKeyboard(rows);
+  if (edit) { try { await ctx.editMessageText(text, { parse_mode: 'HTML', ...kb }); return; } catch (e) { /* fallback kirim pesan baru */ } }
+  return ctx.reply(text, { parse_mode: 'HTML', ...kb });
+}
+
+async function createOrderFromCart(ctx, singleProd = null, singleQty = 1, priceOverride = null) {
+  if (!store.tncOk(ctx.from.id)) {
+    await ctx.answerCbQuery('Setujui SNK dulu ya ✅').catch(() => {});
+    return showSnk(ctx, true);
+  }
+  const uid = ctx.from.id;
+  // ---- gate channel: wajib join channel notif dulu ----
+  if (store.getSetting('gate_checkout', '1') === '1' && !ADMIN_IDS.includes(uid)) {
+    const isMem = await channelMember(ctx.telegram, uid);
+    if (!isMem) {
+      gatePending.set(uid, { singleProd: singleProd || null, singleQty: singleQty || 1 });
+      const gateText = '📢 <b>SATU LANGKAH LAGI!</b>\n\nBiar nggak ketinggalan <b>info restock, flash sale, & promo terbaru</b>, join dulu <b>Channel La Cukai</b> ya — semua info penting selalu diumumkan di sana lebih dulu. 🔔\n\nSudah join? Ketuk tombol di bawah ini, checkout kamu langsung lanjut. 👇';
+      const gateKb = Markup.inlineKeyboard([
+        [Markup.button.url('📢 Join Channel La Cukai', GATE_CH_URL())],
+        [Markup.button.callback('✅ Sudah Join — Lanjut Checkout', 'gate_check')],
+        [Markup.button.callback('‹ Menu Utama', 'menu')],
+      ]);
+      await ctx.answerCbQuery('Join channel dulu ya 📢').catch(() => {});
+      const edited = await ctx.editMessageText(gateText, { parse_mode: 'HTML', ...gateKb }).then(() => true).catch(() => false);
+      if (!edited) await ctx.reply(gateText, { parse_mode: 'HTML', ...gateKb }).catch(() => {});
+      return;
+    }
+  }
+  const items = [];
+  if (singleProd) {
+    const p = store.getProduct(singleProd);
+    if (!p) return ctx.answerCbQuery('Produk tidak ditemukan');
+    items.push({ p, qty: singleQty, unit: priceOverride || flashPriceOf(singleProd) || p.price });
+  } else {
+    for (const [pid, qty] of getCart(uid)) {
+      const p = store.getProduct(pid);
+      if (p) items.push({ p, qty, unit: flashPriceOf(pid) || p.price });
+    }
+    if (!items.length) return ctx.answerCbQuery('Keranjang kosong');
+  }
+  // stock check produk digital (VCC selalu terbuka — kartu diterbitkan otomatis via supplier)
+  for (const { p, qty } of items) {
+    if (p.type === 'digital' && p.stock_n < qty) {
+      await ctx.answerCbQuery(`Stok ${p.name} kurang (sisa ${p.stock_n})`, true).catch(() => {});
+      await vccBlock(ctx, p, qty, `${E.warn} <b>Stok ${esc(p.name)} sudah habis</b>`, 'Stok sedang kosong, coba lagi nanti ya.');
+      return;
+    }
+  }
+  let amount = items.reduce((a, { p, qty, unit }) => a + unit * qty, 0);
+  // voucher
+  const st = inputState.get(uid);
+  let discount = 0, voucherCode = '';
+  if (st && st.mode === 'voucher_ok' && st.data) {
+    const v = store.getVoucher(st.data.code);
+    if (v && (!v.quota || v.used < v.quota) && amount >= (v.min_amount || 0)) {
+      discount = v.kind === 'percent' ? Math.round(amount * v.value / 100) : Math.min(v.value, amount);
+      voucherCode = v.code;
+    }
+  }
+  const total = Math.max(amount - discount, 1000);
+  const orderId = makeOrderId();
+  const prodName = items.length === 1 ? `${items[0].p.name} ×${items[0].qty}` : `${items.length} produk`;
+  const keterangan = `Order ${orderId} - ${SHOP()}`.slice(0, 60);
+  const publicUrl = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
+
+  // ---- jalur bayar pakai SALDO (jika saldo mencukupi) ----
+  const bal = store.walletGet(uid);
+  if (bal >= total) {
+    const expiredAtS = new Date(Date.now() + EXP_MIN * 60000).toISOString();
+    store.db.prepare(`INSERT INTO orders(order_id,user_id,product_id,product_name,qty,amount,discount,total,voucher_code,qris_image,qris_url,expired_at,signature)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(orderId, uid, items[0].p.id, prodName, items.reduce((a, i) => a + i.qty, 0),
+      amount, discount, total, voucherCode, '', '', expiredAtS, '');
+    items.forEach(({ p, qty, unit }) => store.db.prepare('INSERT INTO order_items(order_id,product_id,product_name,qty,price) VALUES(?,?,?,?,?)').run(orderId, p.id, p.name, qty, unit));
+    if (voucherCode) store.useVoucher(voucherCode);
+    if (!singleProd) carts.set(uid, new Map());
+    inputState.delete(uid);
+    const text = `${divider('sparkle')}\n\n   💰 <b>PESANAN SIAP</b>\n\n${box([
+      `${E.ticket} No. Order ─ <code>${orderId}</code>`,
+      `${E.cart} Produk ─ ${esc(prodName)}`,
+      `${E.money} Total Bayar ─ <b>${rp(total)}</b>`,
+    ])}\n\n${E.gem} Saldo kamu <b>${rp(bal)}</b> ─ cukup untuk membayar order ini.\n\n${divider('sparkle')}`;
+    const kb = Markup.inlineKeyboard([
+      [Markup.button.callback(`✅ Bayar dengan Saldo (${rp(total)})`, `saldopay:${orderId}`)],
+      [Markup.button.callback('💳 Bayar via QRIS', `qrinstead:${orderId}`)],
+      [Markup.button.callback('❌ Batalkan Pesanan', `cancel:${orderId}`)],
+    ]);
+    try { await ctx.editMessageText(text, { parse_mode: 'HTML', ...kb }); }
+    catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...kb }); }
+    return;
+  }
+
+  let qd;
+  try {
+    qd = await qris.create({
+      orderId, amount: total, keterangan,
+      callbackUrl: publicUrl ? `${publicUrl}/webhook/qris` : '',
+    });
+  }
+  catch (e) { console.error('[QRIS create]', e.message); await ctx.reply('❌ Gagal membuat pembayaran QRIS. Coba lagi sebentar.'); return; }
+
+  const expiredAt = qd.expired_at || new Date(Date.now() + EXP_MIN * 60000).toISOString();
+  store.db.prepare(`INSERT INTO orders(order_id,user_id,product_id,product_name,qty,amount,discount,total,voucher_code,qris_image,qris_url,expired_at,signature)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(orderId, uid, items[0].p.id, prodName, items.reduce((a, i) => a + i.qty, 0),
+    amount, discount, Number(qd.total_amount || total), voucherCode, '', qd.qris_url || '', expiredAt, qd.signature || '');
+  const insItem = store.db.prepare('INSERT INTO order_items(order_id,product_id,product_name,qty,price) VALUES(?,?,?,?,?)');
+  items.forEach(({ p, qty, unit }) => insItem.run(orderId, p.id, p.name, qty, unit));
+  if (voucherCode) store.useVoucher(voucherCode);
+  if (!singleProd) carts.set(uid, new Map());
+  inputState.delete(uid);
+
+  await sendQrisMessage(ctx, store.getOrder(orderId), qd);
+
+  // notify admins
+  const u = ctx.from;
+  for (const aid of ADMIN_IDS) {
+    ctx.telegram.sendMessage(aid, `${E.bell} <b>Order Baru</b>\n\n${box([
+      `${E.ticket} <code>${orderId}</code>`,
+      `${E.user} ${esc(u.first_name)} (@${esc(u.username || '-')})`,
+      `${E.cart} ${esc(prodName)}`,
+      `${E.money} ${rp(qd.total_amount || total)}`,
+    ])}`, { parse_mode: 'HTML' }).catch(() => {});
+  }
+}
+
+// ---- Fulfill satu item VCC via Senn AutoOrder ----
+const cardHtml = (cards) =>
+  cards.map(s => {
+    const c = senna.parseCard(s);
+    return `💳 <b>Nomor</b> ─ <code>${esc(c.number || c.raw)}</code>\n🗓️ <b>Berlaku</b> ─ <code>${esc(c.exp)}</code>\n🔐 <b>CVV</b> ─ <code>${esc(c.cvv)}</code>`;
+  }).join('\n\n');
+
+const VCC_OTP_INFO = `🔐 <b>INFO OTP (Visa Secure)</b>\nKalau saat memakai kartu ini kamu diminta kode OTP, <b>kode OTP akan dikirim otomatis ke chat ini</b> — tunggu saja pesannya masuk, lalu masukkan kodenya di halaman pembayaran. Tidak perlu tanya admin. Ingat: kode berlaku singkat, segera pakai begitu diterima.`;
+
+const idxSuffix = (idx) => (idx === 0 ? '' : `-v${idx}`);
+
+async function fulfillVccItem(bot, orderId, idx, it, p) {
+  const sennaId = p.senna_product_id;
+  const label = `<b>${esc(it.product_name)} ×${it.qty}</b>`;
+  const adminBase = `${E.card} <b>VCC ORDER</b>\n${box([
+    `${E.ticket} <code>${orderId}</code>`,
+    `${E.cart} ${esc(it.product_name)} ×${it.qty}`,
+  ])}\n`;
+  if (!sennaId || !senna.enabled()) {
+    return {
+      userText: `${label}\n⚠️ Sistem VCC sedang gangguan — admin akan menghubungi Anda.`,
+      adminNote: `${adminBase}${E.warn} produk tidak ter-mapping ke supplier (senna_product_id kosong)`,
+    };
+  }
+  const externalId = `${orderId}${idxSuffix(idx)}`.slice(0, 80);
+  const qty = Math.min(Math.max(1, it.qty), 100);
+  const purpose = (p.description || p.name || 'VCC').slice(0, 200);
+
+  try {
+    await senna.createOrder(externalId, sennaId, { quantity: qty, customPurpose: purpose, saleAmount: it.price * it.qty });
+  } catch (e) {
+    const retriable = e.code === 'insufficient_deposit' || e.code === 'out_of_stock' || /fetch|network|timeout|ECON|ENOT/i.test(String(e.message));
+    if (!retriable) {
+      return {
+        userText: `${label}\n⚠️ Penerbitan kartu gagal (${esc(e.code || 'error')}). Admin akan menghubungi Anda.`,
+        adminNote: `${adminBase}${E.cross} createOrder gagal (tidak bisa diretrial): <code>${esc(e.message)}</code>`,
+      };
+    }
+    // dana pembeli sudah masuk — kartu akan diterbitkan otomatis begitu supplier siap
+    store.markVccState(orderId, 'pending_create');
+    // harga supplier berasal live dari katalog (bisa berubah sewaktu-waktu)
+    let unitPrice = 0;
+    try { const sp = await senna.findProduct(sennaId); unitPrice = Number(sp && sp.price) || 0; } catch (e) {}
+    const needed = e.code === 'insufficient_deposit' ? qty * (unitPrice || 2000) : 0;
+    const adminDetail = e.code === 'insufficient_deposit'
+      ? `${E.money} Deposit supplier kosong — top up <b>minimal ${rp(needed)}</b> di @vccsenna_bot agar order <code>${orderId}</code> bisa terbit`
+      : e.code === 'out_of_stock'
+        ? `${E.warn} Stok supplier habis — kartu terbit otomatis saat stok kembali`
+        : `${E.warn} Server supplier tidak merespons saat checkout`;
+    scheduleVccCreateRetry(bot, orderId, externalId, it, p, purpose);
+    return {
+      userText: `${label}\n✅ Pembayaran diterima.\n⚡ Kartu akan <b>diterbitkan otomatis</b> — nomor, masa berlaku, dan CVV dikirim langsung ke chat ini (biasanya cepat). Bila melebihi 24 jam, hubungi admin dan dana Anda dikembalikan penuh.`,
+      adminNote: `${adminBase}${adminDetail}${e.code === 'insufficient_deposit' ? `\n🔔 Retry otomatis tiap 5 menit, maksimal 24 jam.` : '\n🔔 Retry otomatis berjalan.'}`,
+    };
+  }
+
+  store.markVccState(orderId, 'created');
+  const res = await senna.waitForDelivery(externalId);
+  if (res.status === 'COMPLETED' && res.items && res.items.length) {
+    store.markVccState(orderId, 'done');
+    return { userText: `${label}\n${cardHtml(res.items)}\n\n${VCC_OTP_INFO}` };
+  }
+  if (res.status === 'FAILED') {
+    store.markVccState(orderId, 'failed');
+    const ord = store.getOrder(orderId);
+    if (ord) await refundToWallet(bot, orderId, externalId, ord.user_id, Math.round(Number(it.price) * it.qty), 'Penerbitan kartu gagal di supplier');
+    return {
+      userText: `${label}\n⚠️ Penerbitan kartu gagal di supplier.\n💸 Dana <b>${rp(Math.round(Number(it.price) * it.qty))}</b> sudah dikembalikan ke <b>saldo</b> kamu — bisa dipakai belanja langsung.`,
+      adminNote: `${adminBase}${E.cross} Status <b>FAILED</b>: <code>${esc(res.error)}</code> (refund otomatis ke wallet)`,
+    };
+  }
+  // PENDING / PROCESSING melewati window polling — jadwalkan pengecekan ulang otomatis
+  scheduleVccRetry(bot, orderId, externalId, it);
+  return {
+    userText: `${label}\n⚡ Kartu sedang diterbitkan oleh supplier — data akan dikirim otomatis. Kalau lebih dari 30 menit, hubungi admin.`,
+    adminNote: `${adminBase}${E.clock} Masih <b>${esc(res.status)}</b> — retry otomatis berjalan.`,
+  };
+}
+
+// cek ulang berkala 1x/menit hingga 30x, kartu dikirim langsung ke pembeli saat COMPLETED
+function scheduleVccRetry(bot, orderId, externalId, it) {
+  const maxAttempts = 30;
+  let attempts = 0;
+  const o = store.getOrder(orderId);
+  const tick = async () => {
+    attempts++;
+    const cur = store.getOrder(orderId);
+    if (!cur || cur.status === 'cancelled' || cur.status === 'expired') return;
+    try {
+      const res = await senna.waitForDelivery(externalId, { maxMs: 5000 });
+      if (res.status === 'COMPLETED') {
+        store.markVccState(orderId, 'done');
+        const body = `<b>${esc(it.product_name)} ×${it.qty}</b>\n${cardHtml(res.items)}`;
+        store.db.prepare(`UPDATE orders SET delivered_content = CASE WHEN delivered_content IS NULL OR delivered_content='' THEN ? ELSE delivered_content || char(10) || ? END WHERE order_id=?`).run(body, body, orderId);
+        if (o) bot.telegram.sendMessage(o.user_id, `✨ <b>KARTU ANDA SUDAH TERBIT</b>\n\n${E.ticket} No. Order ─ <code>${esc(orderId)}</code>\n\n${body}\n\n${VCC_OTP_INFO}`, { parse_mode: 'HTML' }).catch(() => {});
+        for (const aid of ADMIN_IDS) bot.telegram.sendMessage(aid, `${E.check} VCC <code>${orderId}</code> terbit sukses (retry otomatis).`, { parse_mode: 'HTML' }).catch(() => {});
+        return;
+      }
+      if (res.status === 'FAILED') {
+        store.markVccState(orderId, 'failed');
+        if (o) await refundToWallet(bot, orderId, externalId, o.user_id, it.price * it.qty, 'Penerbitan kartu gagal di supplier');
+        for (const aid of ADMIN_IDS) bot.telegram.sendMessage(aid, `${E.cross} VCC <code>${orderId}</code> FAILED: <code>${esc(res.error)}</code> — refund otomatis ke wallet`, { parse_mode: 'HTML' }).catch(() => {});
+        return;
+      }
+    } catch (e) {}
+    if (attempts < maxAttempts) setTimeout(tick, 60000);
+  };
+  setTimeout(tick, 60000);
+}
+
+// order gagal dibuat di supplier (deposit/stok kosong) — coba buat ulang tiap 5 menit maks 24 jam
+function scheduleVccCreateRetry(bot, orderId, externalId, it, p, purpose) {
+  const maxAttempts = 288; // 5 menit x 288 = 24 jam
+  const sennaId = p.senna_product_id;
+  const qty = Math.min(Math.max(1, it.qty), 100);
+  const label = `<b>${esc(it.product_name)} ×${it.qty}</b>`;
+  let attempts = 0;
+  const o = store.getOrder(orderId);
+  const finish = async (res) => {
+    store.markVccState(orderId, 'done');
+    const body = `${label}\n${cardHtml(res.items)}`;
+    store.db.prepare(`UPDATE orders SET delivered_content = CASE WHEN delivered_content IS NULL OR delivered_content='' THEN ? ELSE delivered_content || char(10) || ? END WHERE order_id=?`).run(body, body, orderId);
+    if (o) bot.telegram.sendMessage(o.user_id, `✨ <b>KARTU ANDA SUDAH TERBIT</b>\n\n${E.ticket} No. Order ─ <code>${esc(orderId)}</code>\n\n${body}\n\n${VCC_OTP_INFO}`, { parse_mode: 'HTML' }).catch(() => {});
+    for (const aid of ADMIN_IDS) bot.telegram.sendMessage(aid, `${E.check} VCC <code>${orderId}</code> akhirnya terbit (retry deposit).`, { parse_mode: 'HTML' }).catch(() => {});
+  };
+  const tick = async () => {
+    attempts++;
+    const cur = store.getOrder(orderId);
+    if (!cur || cur.status === 'cancelled' || cur.status === 'expired') return;
+    try {
+      await senna.createOrder(externalId, sennaId, { quantity: qty, customPurpose: purpose, saleAmount: it.price * it.qty });
+      store.markVccState(orderId, 'created');
+      const res = await senna.waitForDelivery(externalId);
+      if (res.status === 'COMPLETED' && res.items && res.items.length) return finish(res);
+      if (res.status === 'FAILED') {
+        store.markVccState(orderId, 'failed');
+        if (o) await refundToWallet(bot, orderId, externalId, o.user_id, it.price * it.qty, `Penerbitan gagal di supplier (${res.error})`);
+        for (const aid of ADMIN_IDS) bot.telegram.sendMessage(aid, `${E.cross} VCC <code>${orderId}</code> FAILED: <code>${esc(res.error)}</code> — refund otomatis ke wallet`, { parse_mode: 'HTML' }).catch(() => {});
+        return;
+      }
+    } catch (e) {
+      // masih gagal (deposit/stok belum ready) — lanjut jadwal
+      if (e.code && !['insufficient_deposit', 'out_of_stock', 'supplier_rate_limited'].includes(e.code)) {
+        for (const aid of ADMIN_IDS) bot.telegram.sendMessage(aid, `${E.warn} VCC <code>${orderId}</code> retry gagal berulang: <code>${esc(e.message)}</code> — periksa manual`, { parse_mode: 'HTML' }).catch(() => {});
+        return;
+      }
+    }
+    if (attempts < maxAttempts) setTimeout(tick, 5 * 60 * 1000);
+    else {
+      store.markVccState(orderId, 'failed');
+      if (o) await refundToWallet(bot, orderId, externalId, o.user_id, it.price * it.qty, 'Kartu tidak terbit dalam 24 jam');
+      for (const aid of ADMIN_IDS) bot.telegram.sendMessage(aid, `${E.warn} VCC <code>${orderId}</code> lewat 24 jam — refund otomatis ke wallet sudah berjalan.`, { parse_mode: 'HTML' }).catch(() => {});
+    }
+  };
+  setTimeout(tick, 5 * 60 * 1000);
+}
+
+async function fulfillOrder(bot, orderId, paidAt) {
+  const o = store.getOrder(orderId);
+  if (!o || o.status === 'paid') return false;
+  const items = store.db.prepare('SELECT * FROM order_items WHERE order_id=?').all(orderId);
+  const parts = [];
+  qrisMarkClosed(bot, o, `${E.check} <b>PEMBAYARAN DITERIMA</b>`, 'Terima kasih — order diproses.');
+  for (let idx = 0; idx < items.length; idx++) {
+    const it = items[idx];
+    const p = store.getProduct(it.product_id);
+    if (p && p.type === 'vcc') {
+      const { userText, adminNote } = await fulfillVccItem(bot, orderId, idx, it, p);
+      parts.push(userText);
+      if (adminNote) for (const aid of ADMIN_IDS) bot.telegram.sendMessage(aid, adminNote, { parse_mode: 'HTML' }).catch(() => {});
+    } else if (p && p.type === 'digital') {
+      const codes = store.claimStock(it.product_id, it.qty, orderId);
+      if (codes && codes.length) parts.push(`<b>${esc(it.product_name)} ×${it.qty}</b>\n${codes.map(c => `<code>${esc(c)}</code>`).join('\n')}`);
+      else parts.push(`<b>${esc(it.product_name)} ×${it.qty}</b>\n⚠️ Stok otomatis kosong — admin akan kirim manual.`);
+    } else {
+      parts.push(`<b>${esc(it.product_name)} ×${it.qty}</b>\n📦 Produk layanan — tim kami akan segera memproses.`);
+    }
+  }
+  const delivered = parts.join('\n\n');
+  store.setOrderStatus(orderId, 'paid', { paid_at: paidAt, delivered_content: delivered });
+
+  // invoice ke channel
+  const buyerRow = store.db.prepare('SELECT first_name, username FROM users WHERE id=?').get(o.user_id);
+  notify.announceInvoice({
+    orderId,
+    buyer: (buyerRow && (buyerRow.first_name || buyerRow.username)) || '',
+    items: items.map((it) => ({ name: it.product_name, qty: it.qty })),
+    total: o.total,
+    paidAt,
+  });
+
+  const sb = stepsBlock('paid');
+  const msg = `${divider('sparkle')}\n\n   ${E.party}${E.confetti} <b>PEMBAYARAN BERHASIL!</b> ${E.confetti}${E.party}\n\n${divider('single')}\n\nTerima kasih atas kepercayaan Anda\nberbelanja di <b>${esc(SHOP())}</b> ${E.gem}\n\n${box([`${E.ticket} No. Order ─ <code>${orderId}</code>`])}\n\n${sb.bar}\n${sb.lines}\n\n${divider('dot')}\n<b>PRODUK ANDA</b>\n${divider('dot')}\n${delivered}\n\n<i>Mohon simpan data di atas dengan aman.</i>\n\n${E.star} Berikan penilaian Anda:\n${divider('sparkle')}`;
+  const kb = Markup.inlineKeyboard([
+    [Markup.button.callback('⭐', `rate:${orderId}:1`), Markup.button.callback('⭐⭐', `rate:${orderId}:2`), Markup.button.callback('⭐⭐⭐', `rate:${orderId}:3`), Markup.button.callback('⭐⭐⭐⭐', `rate:${orderId}:4`), Markup.button.callback('⭐⭐⭐⭐⭐', `rate:${orderId}:5`)],
+    [Markup.button.url('👥 Gabung Grup Diskusi La Cukai', GROUP_URL())],
+    [Markup.button.callback('🛍️ Belanja Lagi', 'cats'), Markup.button.callback('‹ Menu Utama', 'menu')],
+  ]);
+  await bot.telegram.sendMessage(o.user_id, msg, { parse_mode: 'HTML', ...kb }).catch(() => {});
+  for (const aid of ADMIN_IDS) {
+    bot.telegram.sendMessage(aid, `${E.money} <b>Order LUNAS</b>\n\n${box([
+      `${E.ticket} <code>${orderId}</code>`,
+      `${E.card} ${rp(o.total)}`,
+    ])}`, { parse_mode: 'HTML' }).catch(() => {});
+  }
+  // low stock alert
+  const th = Number(store.getSetting('low_stock_threshold', '3')) || 3;
+  for (const it of items) {
+    const p = store.getProduct(it.product_id);
+    if (p && p.type === 'digital' && p.stock_n <= th) {
+      for (const aid of ADMIN_IDS) bot.telegram.sendMessage(aid, `⚠️ <b>Stok menipis:</b> ${esc(p.name)} (sisa ${p.stock_n})`).catch(() => {});
+    }
+  }
+  return true;
+}
+
+// ══════════════════════════════════════════
+// ⚡ FLASH SALE
+// ══════════════════════════════════════════
+async function renderFlash(ctx, page = 1) {
+  const back = Markup.inlineKeyboard([[Markup.button.callback('‹ Menu Utama', 'menu')]]);
+  const flash = getFlash();
+  if (!flash) {
+    const text = `${divider('sparkle')}\n\n${E.bolt} <b>FLASH SALE</b>\n${DIV}\n\n${E.clock} Belum ada flash sale aktif.\nNantikan promo spesial berikutnya! ${E.fire}\n\n${divider('sparkle')}`;
+    try { return await ctx.editMessageText(text, { parse_mode: 'HTML', ...back }); } catch (e) { return; }
+  }
+  const remain = new Date(flash.ends_at).getTime() - Date.now();
+  const items = [];
+  for (const [pid, fp] of Object.entries(flash.items)) {
+    const p = store.getProduct(pid);
+    if (!p || !p.is_active) continue;
+    items.push({ p, fp });
+  }
+  const pages = Math.max(1, Math.ceil(items.length / FLASH_PAGE));
+  page = Math.min(Math.max(1, Number(page) || 1), pages);
+  const slice = items.slice((page - 1) * FLASH_PAGE, page * FLASH_PAGE);
+  const lines = [
+    divider('sparkle'),
+    '',
+    `   ${E.bolt}${E.fire} <b>FLASH SALE</b> ${E.fire}${E.bolt}`,
+    '',
+    `${E.clock} Berakhir dalam: <b>${fmtCountdown(remain)}</b>`,
+    `${progressBar(1, 1, 20)}`,
+    '',
+    divider('dot'),
+  ];
+  const rows = [];
+  for (const { p, fp } of slice) {
+    const disc = discountPct(p.price, fp);
+    lines.push(box([
+      `${E.package} <b>${esc(p.name)}</b>`,
+      `${E.cross} <s>${rp(p.price)}</s>`,
+      `${E.bolt} <b>${rp(fp)}</b> ${disc ? `(-${disc}%)` : ''}`,
+      `${E.fire} ${E.tag} Hemat ${rp(p.price - fp)}`,
+      `${E.package} Sisa stok: <b>${p.type === 'digital' ? p.stock_n : (p.type === 'vcc' ? (p.senna_stok == null ? 'diberbitkan otomatis' : (p.senna_stok > 0 ? p.senna_stok : 'menunggu supplier — terbit otomatis')) : 'terbatas')}</b>`,
+    ]));
+    rows.push([Markup.button.callback(`⚡ ${p.name} — ${rp(fp)}`, `flashbuy:${p.id}`)]);
+  }
+  if (!items.length) {
+    lines.push(`${E.warn} Produk flash sale sudah tidak tersedia.`);
+  }
+  if (pages > 1) lines.push('', `${E.package} Halaman <b>${page}</b> dari <b>${pages}</b>`);
+  lines.push('', `${E.warn} <b>Stok sangat terbatas!</b> Buruan sebelum kehabisan! ${E.rocket}`, '', divider('sparkle'));
+  rows.push(...pageNav('menu_flash', page, pages));
+  rows.push([Markup.button.callback('🔄 Refresh', `menu_flash:${page}`)]);
+  rows.push([Markup.button.callback('‹ Menu Utama', 'menu')]);
+  const text = lines.join('\n');
+  try { await ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }); }
+  catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }); }
+}
+
+// ══════════════════════════════════════════
+// 🏆 TESTIMONI
+// ══════════════════════════════════════════
+async function renderTestimonials(ctx, page = 1) {
+  const stats = store.db.prepare("SELECT COUNT(*) n, AVG(rating) a FROM orders WHERE status='paid' AND rating>0").get();
+  const pages = Math.max(1, Math.ceil((stats.n || 0) / TESTI_PAGE));
+  page = Math.min(Math.max(1, Number(page) || 1), pages);
+  const rows = store.db.prepare(`
+    SELECT o.rating, o.review, o.product_name, o.paid_at, COALESCE(NULLIF(u.first_name,''),'Pelanggan') AS name
+    FROM orders o LEFT JOIN users u ON u.id=o.user_id
+    WHERE o.status='paid' AND o.rating>0
+    ORDER BY o.id DESC LIMIT ? OFFSET ?`).all(TESTI_PAGE, (page - 1) * TESTI_PAGE);
+  const kb = Markup.inlineKeyboard([
+    ...pageNav('menu_testimoni', page, pages),
+    [Markup.button.callback(`${E.bag} Belanja Sekarang`, 'cats')],
+    [Markup.button.callback('‹ Menu Utama', 'menu')],
+  ]);
+  if (!rows.length) {
+    const text = `${divider('sparkle')}\n\n${E.trophy} <b>TESTIMONI PELANGGAN</b>\n${DIV}\n\n${E.clock} Belum ada testimoni.\nJadilah yang pertama memberi ulasan! ${E.star}\n\n${divider('sparkle')}`;
+    try { return await ctx.editMessageText(text, { parse_mode: 'HTML', ...kb }); } catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...kb }); }
+  }
+  const avg = (stats.a || 0).toFixed(1);
+  const lines = [
+    divider('sparkle'),
+    '',
+    `   ${E.trophy} <b>TESTIMONI PELANGGAN</b>`,
+    '',
+    `${E.star} Rating rata-rata: <b>${avg}/5</b> (${stats.n} ulasan)`,
+    `${E.users} Dari pelanggan yang sudah berbelanja`,
+    '',
+    divider('dot'),
+  ];
+  for (const r of rows) {
+    const stars = '⭐'.repeat(r.rating);
+    lines.push(box([
+      `${E.user} <b>${esc(r.name)}</b> ─ ${stars}`,
+      `${E.package} ${esc(r.product_name)}`,
+      ...(r.review ? [`${E.heart} <i>"${esc(String(r.review).replace(/\s+/g, ' ').slice(0, 160))}"</i>`] : []),
+    ]));
+  }
+  if (pages > 1) lines.push('', `${E.package} Halaman <b>${page}</b> dari <b>${pages}</b>`);
+  lines.push('', divider('sparkle'));
+  const text = lines.join('\n');
+  try { await ctx.editMessageText(text, { parse_mode: 'HTML', ...kb }); }
+  catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...kb }); }
+}
+
+// ══════════════════════════════════════════
+// 💠 APPS & PARTNER PREMIUM
+// ══════════════════════════════════════════
+const PARTNER_PAGE = 8;
+async function renderPartners(ctx, page = 1) {
+  const all = store.partners(true);
+  const pages = Math.max(1, Math.ceil(all.length / PARTNER_PAGE));
+  page = Math.min(Math.max(1, Number(page) || 1), pages);
+  const items = all.slice((page - 1) * PARTNER_PAGE, page * PARTNER_PAGE);
+  const lines = [divider('sparkle'), '', `${E.spark} <b>APPS & PARTNER PREMIUM</b>`, DIV, '', `${E.star} Koleksi app & bot rekomendasi toko.`, ''];
+  const rows = items.map((p) => [Markup.button.callback(`${p.badge ? '【' + esc(p.badge) + '】 ' : ''}${esc(p.name)}`, `partner:${p.id}:${page}`)]);
+  if (!items.length) lines.push(`${E.warn} Belum ada partner. Segera hadir!`, '');
+  if (pages > 1) lines.push('', `${E.package} Halaman <b>${page}</b> dari <b>${pages}</b>`);
+  lines.push('', divider('sparkle'));
+  rows.push(...pageNav('menu_partners', page, pages));
+  rows.push([Markup.button.callback('‹ Menu Utama', 'menu')]);
+  const text = lines.join('\n');
+  try { await ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }); }
+  catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }); }
+}
+
+async function renderPartnerDetail(ctx, id, page = 1) {
+  const p = store.db.prepare('SELECT * FROM partners WHERE id=?').get(id);
+  if (!p) return renderPartners(ctx, page);
+  const lines = [divider('sparkle'), '', `${E.package} <b>${esc(p.name).toUpperCase()}</b>`];
+  if (p.badge) lines.push(`${E.tag} ${esc(p.badge)}`);
+  if (p.category) lines.push(`${E.spark} Kategori: ${esc(p.category)}`);
+  lines.push(DIV);
+  if (p.description) for (const d of String(p.description).split('\n')) lines.push(`${esc(d)}`);
+  lines.push('', `${E.info} App ini dikelola oleh partner. Ada kendala? Hubungi admin toko ya.`, '', divider('sparkle'));
+  const rows = [];
+  if (p.link && /^(https?:\/\/|t\.me\/|@)/i.test(p.link.trim())) {
+    const link = p.link.trim();
+    const url = link.startsWith('t.me/') ? 'https://' + link : (link.startsWith('@') ? 'https://t.me/' + link.slice(1) : link);
+    rows.push([Markup.button.url(`🚀 Buka ${esc(p.name)}`, url)]);
+  }
+  rows.push([Markup.button.callback('‹ Kembali ke Daftar', `menu_partners:${page}`)], [Markup.button.callback('‹ Menu Utama', 'menu')]);
+  const text = lines.join('\n');
+  try { await ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }); }
+  catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }); }
+}
+
+async function showSnk(ctx, resume = false) {
+  const t = esc(String(store.getSetting('tnc_text', '') || '')).split('\n').filter((x) => x.trim());
+  const lines = [divider('sparkle'), '', `${E.info} <b>SYARAT & KETENTUAN</b>\n${DIV}`, '', ...t.map((x) => `${x}`), '', `${E.info} Bantuan: ${esc(store.getSetting('admin_contact', '@lacukbot'))}`];
+  if (resume) lines.push('', `${E.bolt} <i>Setuju dulu ya, lalu ketuk lagi tombol <b>Checkout/Beli</b> yang tadi.</i>`);
+  lines.push('', divider('sparkle'));
+  const kb = Markup.inlineKeyboard([
+    [Markup.button.callback(`${E.check} Saya Setuju`, 'tnc_ok')],
+    [Markup.button.callback('‹ Menu Utama', 'menu')],
+  ]);
+  const text = lines.join('\n');
+  try { await ctx.editMessageText(text, { parse_mode: 'HTML', ...kb }); }
+  catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...kb }); }
+}
+
+// ══════════════════════════════════════════
+// 👤 PROFIL MEMBER
+// ══════════════════════════════════════════
+async function renderProfile(ctx) {
+  const uid = ctx.from.id;
+  const s = store.db.prepare(`SELECT COUNT(*) total,
+      COUNT(CASE WHEN status='paid' THEN 1 END) paid_n,
+      COALESCE(SUM(CASE WHEN status='paid' THEN total ELSE 0 END),0) spent,
+      MIN(created_at) first_order
+    FROM orders WHERE user_id=?`).get(uid);
+  const u = store.db.prepare('SELECT created_at FROM users WHERE id=?').get(uid);
+  const t = memberTier(s.paid_n);
+  const lines = [
+    divider('sparkle'),
+    '',
+    `   ${E.user} <b>PROFIL SAYA</b>`,
+    '',
+    box([
+      `${E.crown} <b>${esc(ctx.from.first_name || 'Customer')}</b>`,
+      `${E.info} ID: <code>${uid}</code>`,
+      `${E.medal} Level: ${t.cur.icon} <b>${t.cur.name}</b>`,
+      `${E.next} Next: ${t.next ? `${t.next.icon} ${t.next.name} (${s.paid_n}/${t.next.min})` : '🏆 MAX'}`,
+      `${progressBar(t.progress, 100, 15)} ${t.progress}%`,
+    ]),
+    '',
+    `${E.spark} <b>Statistik:</b>`,
+    `├ ${E.cart} Total Order: ${s.total}`,
+    `├ ${E.check} Selesai: ${s.paid_n}`,
+    `└ ${E.money} Total Belanja: <b>${rp(s.spent)}</b>`,
+    '',
+    divider('dot'),
+    '',
+    `${E.gift} <b>Member Benefits:</b>`,
+    ...['🥉 Bronze: -', '🥈 Silver: Extra 5% discount', '🥇 Gold: Extra 10% discount', '👑 Diamond: Extra 15% + Priority'].map(b => `├ ${b}`),
+    '',
+    `${E.cal} Member sejak: ${u ? new Date(u.created_at + 'Z').toLocaleDateString('id-ID', { timeZone: 'Asia/Jakarta' }) : '-'}`,
+    '',
+    divider('sparkle'),
+  ];
+  const kb = Markup.inlineKeyboard([
+    [Markup.button.callback(`${E.cart} Pesanan Saya`, 'orders')],
+    [Markup.button.callback('‹ Menu Utama', 'menu')],
+  ]);
+  const text = lines.join('\n');
+  try { await ctx.editMessageText(text, { parse_mode: 'HTML', ...kb }); }
+  catch (e) { return ctx.reply(text, { parse_mode: 'HTML', ...kb }); }
+}
+
+// ══════════════════════════════════════════
+// 🤖 BOT SETUP
+// ══════════════════════════════════════════
+function setupBot() {
+  const bot = new Telegraf(process.env.BOT_TOKEN);
+
+  bot.start(async (ctx) => {
+    const isNew = !store.db.prepare('SELECT id FROM users WHERE id=?').get(ctx.from.id);
+    store.upsertUser(ctx.from.id, ctx.from.username, ctx.from.first_name);
+    if (isNew) {
+      const total = store.db.prepare('SELECT COUNT(*) c FROM users').get().c;
+      notify.notify(`🎉 <b>Pelanggan Baru Bergabung!</b>
+
+👤 <b>Nama</b> ─ ${esc(ctx.from.first_name)} (@${esc(ctx.from.username || '-')})
+🪪 <b>ID</b> ─ <code>${ctx.from.id}</code>
+📈 <b>Total Pelanggan</b> ─ ${total}
+
+Selamat datang di <b>La Cukai Shop</b> 💚
+Of order tiket, tap me: ${shopBotLink()}`);
+    }
+    await showMenu(ctx, false);
+  });
+  bot.command('menu', (ctx) => showMenu(ctx, false));
+  bot.command('snk', (ctx) => showSnk(ctx));
+  bot.command('katalog', async (ctx) => { const m = await ctx.reply('…'); ctx.callbackQuery = { data: 'cats' }; await showCats({ ...ctx, editMessageText: (t, e) => ctx.telegram.editMessageText(m.chat.id, m.message_id, undefined, t, e), from: ctx.from }); });
+  bot.command('keranjang', async (ctx) => { const m = await ctx.reply('Memuat...'); try { await showCart({ ...ctx, editMessageText: (t, e) => ctx.telegram.editMessageText(m.chat.id, m.message_id, undefined, t, e) }); } catch (e) {} });
+  bot.command('pesanan', (ctx) => renderOrders(ctx, 1, false));
+  bot.command('cari', (ctx) => { inputState.set(ctx.from.id, { mode: 'search' }); return ctx.reply(`${E.search} <b>PENCARIAN PRODUK</b>\n\nKetik kata kunci produk yang dicari:`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('Batal', 'menu')]]) }); });
+  bot.command('bantuan', (ctx) => { store.openTicket(ctx.from.id); inputState.set(ctx.from.id, { mode: 'ticket' }); return ctx.reply(`${E.inbox} <b>CHAT ADMIN</b>\n\n${String(store.getSetting('help_text', '') || 'Ketik pesan kamu di bawah, admin akan membalas secepatnya.')}`, { parse_mode: 'HTML' }); });
+  bot.command('help', (ctx) => ctx.reply('<b>Perintah yang tersedia:</b>\n/katalog - Lihat produk\n/cari - Cari produk\n/keranjang - Keranjang belanja\n/pesanan - Riwayat pesanan\n/bantuan - Hubungi admin', { parse_mode: 'HTML' }));
+  bot.command('admin', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Khusus admin.');
+    const s = store.orderStats();
+    const proto = process.env.PUBLIC_URL || '';
+    ctx.reply(`${E.tools} <b>Panel Admin</b>\n\n${box([
+      `${E.money} Omzet hari ini ─ <b>${rp(s.today_revenue)}</b>`,
+      `${E.ticket} Order hari ini ─ ${s.today_orders}`,
+      `${E.clock} Pending ─ ${s.pending}`,
+      `${E.package} Produk aktif ─ ${s.products}`,
+      `${E.users} Pengguna ─ ${s.users}`,
+    ])}\n\n🌐 Web admin: ${proto ? `<a href="${proto}">buka dashboard</a>` : 'belum dikonfigurasi'}`,
+      { parse_mode: 'HTML', disable_web_page_preview: true });
+  });
+
+  // ─── admin: vcc restock watcher ───
+  bot.command('vccinfo', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Khusus admin.');
+    return ctx.reply(await vccwatch.stocks(), { parse_mode: 'HTML', disable_web_page_preview: true });
+  });
+  bot.command('vccon', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Khusus admin.');
+    store.setSetting('vcc_restock_channel', '1');
+    return ctx.reply('✅Info restock VCC → <b>channel DIHIDUPKAN</b>. Cek status: /vccinfo', { parse_mode: 'HTML' });
+  });
+  bot.command('vccoff', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Khusus admin.');
+    store.setSetting('vcc_restock_channel', '0');
+    return ctx.reply('❌ Info restock VCC → <b>channel DIMATIKAN</b>. Cek status: /vccinfo', { parse_mode: 'HTML' });
+  });
+  bot.command('vccuseron', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Khusus admin.');
+    store.setSetting('vcc_restock_users', '1');
+    return ctx.reply('✅ Info restock VCC → <b>broadcast ke user bot DIHIDUPKAN</b>. Cek status: /vccinfo', { parse_mode: 'HTML' });
+  });
+  bot.command('vccuseroff', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Khusus admin.');
+    store.setSetting('vcc_restock_users', '0');
+    return ctx.reply('❌ Info restock VCC → <b>broadcast ke user bot DIMATIKAN</b>. Cek status: /vccinfo', { parse_mode: 'HTML' });
+  });
+
+  // ─── admin: broadcast produk baru/restock ke user bot ───
+  bot.command('bcprod', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Khusus admin.');
+    const on = store.getSetting('product_notify_users', '1') !== '1';
+    store.setSetting('product_notify_users', on ? '1' : '0');
+    return ctx.reply(`📢 Broadcast <b>PRODUK BARU</b> ke user bot: <b>${on ? 'AKTIF' : 'MATI'}</b>`);
+  });
+  bot.command('bcrestock', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Khusus admin.');
+    const on = store.getSetting('restock_notify_users', '0') !== '1';
+    store.setSetting('restock_notify_users', on ? '1' : '0');
+    return ctx.reply(`📢 Broadcast <b>STOK BARU MASUK</b> ke user bot: <b>${on ? 'AKTIF' : 'MATI'}</b>`);
+  });
+
+  // ─── admin: flash sale config ───
+  bot.command('flash', (ctx) => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Khusus admin.');
+    const args = ctx.message.text.trim().split(/\s+/).slice(1);
+    const cfg = readFlashCfg() || { active: false, ends_at: '', items: {} };
+    cfg.items = cfg.items || {};
+    const usage = `${E.bolt} <b>Konfigurasi Flash Sale</b>\n\n` +
+      `<code>/flash</code> — lihat status\n` +
+      `<code>/flash add &lt;product_id&gt; &lt;harga&gt; &lt;menit&gt;</code> — tambah/ubah item\n` +
+      `<code>/flash remove &lt;product_id&gt;</code> — hapus item\n` +
+      `<code>/flash end</code> — akhiri sekarang`;
+    if (!args[0] || args[0] === 'status') {
+      const active = getFlash();
+      const items = Object.entries(cfg.items).map(([pid, pr]) => {
+        const p = store.getProduct(pid);
+        return `├ ${p ? esc(p.name) : pid} ─ ${rp(pr)}${p ? ` (normal ${rp(p.price)})` : ''}`;
+      }).join('\n') || '├ (kosong)';
+      return ctx.reply(`${E.bolt} <b>FLASH SALE</b>\n\nStatus: <b>${active ? '🟢 AKTIF' : '🔴 Nonaktif'}</b>${cfg.name ? `\nPromo: <b>${esc(cfg.name)}</b>` : ''}${cfg.starts_at ? `\nMulai: ${new Date(cfg.starts_at).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}` : ''}\nBerakhir: ${cfg.ends_at ? new Date(cfg.ends_at).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' }) : '-'}\n\n${items}\n\n${usage}`, { parse_mode: 'HTML' });
+    }
+    if (args[0] === 'add') {
+      const [, pid, price, minutes] = args;
+      if (!pid || !price || !minutes || !Number(price) || !Number(minutes)) return ctx.reply(usage, { parse_mode: 'HTML' });
+      const p = store.getProduct(pid);
+      if (!p) return ctx.reply('❌ Produk tidak ditemukan. Cek product_id yang valid.');
+      cfg.items[pid] = Number(price);
+      cfg.ends_at = new Date(Date.now() + Number(minutes) * 60000).toISOString();
+      cfg.starts_at = '';
+      cfg.active = true;
+      writeFlash(cfg);
+      return ctx.reply(`✅ <b>${esc(p.name)}</b> masuk flash sale:\n${rp(p.price)} → <b>${rp(Number(price))}</b>\nBerlaku ${minutes} menit.`, { parse_mode: 'HTML' });
+    }
+    if (args[0] === 'remove') {
+      if (!args[1]) return ctx.reply(usage, { parse_mode: 'HTML' });
+      delete cfg.items[args[1]];
+      if (!Object.keys(cfg.items).length) cfg.active = false;
+      writeFlash(cfg);
+      return ctx.reply('✅ Item dihapus dari flash sale.');
+    }
+    if (args[0] === 'end') {
+      cfg.active = false;
+      writeFlash(cfg);
+      return ctx.reply('✅ Flash sale diakhiri.');
+    }
+    return ctx.reply(usage, { parse_mode: 'HTML' });
+  });
+
+  // callbacks
+  bot.action('menu', (ctx) => { ctx.answerCbQuery().catch(() => {}); return showMenu(ctx); });
+  bot.action('noop', (ctx) => ctx.answerCbQuery().catch(() => {}));
+  bot.action('cats', (ctx) => { ctx.answerCbQuery().catch(() => {}); return showCats(ctx); });
+  bot.action('search', (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    inputState.set(ctx.from.id, { mode: 'search' });
+    return ctx.reply(`${E.search} <b>PENCARIAN PRODUK</b>\n\nKetik kata kunci produk, contoh:\n• <code>spotify</code>\n• <code>canva</code>\n• <code>vpn</code>\n• <code>gmail</code>`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('Batal', 'menu')]]) });
+  });
+  bot.action(/^srch:(\d+):(\d+)$/, (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    return renderSearch(ctx, ctx.match[1], Number(ctx.match[2]) || 1, true);
+  });
+  bot.action(/^(cat):(.+)/, (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    const [catId, pg] = ctx.match[2].split(':');
+    return showProducts(ctx, catId, Number(pg) || 1);
+  });
+  bot.action(/^(prod):(.+)/, (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    const [pid, pg] = ctx.match[2].split(':');
+    return showProduct(ctx, pid, Number(pg) || 1);
+  });
+  bot.action(/^(qty):(.+):(-?1)/, async (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    const uid = ctx.from.id; const v = viewQty.get(uid);
+    if (!v || v.prodId !== ctx.match[2]) return;
+    const p = store.getProduct(v.prodId);
+    const nq = Math.min(Math.max(v.qty + Number(ctx.match[3]), 1), 99);
+    viewQty.set(uid, { prodId: v.prodId, qty: nq, page: v.page || 1 });
+    await renderProduct(ctx, p, nq, v.page || 1);
+  });
+  bot.action(/^(addcart):(.+)/, async (ctx) => {
+    const uid = ctx.from.id; const v = viewQty.get(uid);
+    const pid = ctx.match[2];
+    const qty = (v && v.prodId === pid) ? v.qty : 1;
+    const cart = getCart(uid);
+    cart.set(pid, (cart.get(pid) || 0) + qty);
+    await ctx.answerCbQuery(`✅ ${qty}× ditambahkan ke keranjang`, false);
+  });
+  bot.action(/^(flashbuy):(.+)/, async (ctx) => {
+    const pid = ctx.match[2];
+    const fp = flashPriceOf(pid);
+    if (!fp) return ctx.answerCbQuery('⚡ Flash sale sudah berakhir.', true);
+    const uid = ctx.from.id; const v = viewQty.get(uid);
+    const qty = (v && v.prodId === pid) ? v.qty : 1;
+    await ctx.answerCbQuery().catch(() => {});
+    const pend = { singleProd: pid, singleQty: qty, priceOverride: fp };
+    checkoutPending.set(uid, pend);
+    return showCheckoutConfirm(ctx, pend);
+  });
+  bot.action(/^(buy):(.+)/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const uid = ctx.from.id; const v = viewQty.get(uid);
+    const qty = (v && v.prodId === ctx.match[2]) ? v.qty : 1;
+    const pend = { singleProd: ctx.match[2], singleQty: qty, priceOverride: null };
+    checkoutPending.set(uid, pend);
+    return showCheckoutConfirm(ctx, pend);
+  });
+  bot.action('cart', (ctx) => { ctx.answerCbQuery().catch(() => {}); return showCart(ctx); });
+  bot.action(/^(cartqty):(.+):(-?1)/, async (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    const cart = getCart(ctx.from.id); const pid = ctx.match[2];
+    const nq = (cart.get(pid) || 0) + Number(ctx.match[3]);
+    if (nq <= 0) cart.delete(pid); else cart.set(pid, nq);
+    return showCart(ctx);
+  });
+  bot.action(/^(cartdel):(.+)/, (ctx) => { ctx.answerCbQuery().catch(() => {}); getCart(ctx.from.id).delete(ctx.match[2]); return showCart(ctx); });
+  bot.action('cartclear', (ctx) => { ctx.answerCbQuery().catch(() => {}); carts.set(ctx.from.id, new Map()); return showCart(ctx); });
+  bot.action('voucher', (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    inputState.set(ctx.from.id, { mode: 'voucher' });
+    return ctx.reply(`${E.gift} <b>VOUCHER DISKON</b>\n${DIV}\n\nKetik kode voucher Anda:`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('Batal', 'cart')]]) });
+  });
+  bot.action('checkout', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const pend = { singleProd: null, singleQty: 1, priceOverride: null };
+    checkoutPending.set(ctx.from.id, pend);
+    return showCheckoutConfirm(ctx, pend);
+  });
+  bot.action('co_pay', async (ctx) => {
+    const uid = ctx.from.id;
+    const pend = checkoutPending.get(uid);
+    if (!pend) { await ctx.answerCbQuery('Sesi checkout sudah berakhir — ulangi dari katalog ya.').catch(() => {}); return; }
+    if (!pend.tosOk) {
+      const { items: coIt } = coItems(uid, pend);
+      if (tosRequired(uid, coIt).length) {
+        await ctx.answerCbQuery('Setujui dulu ketentuan produknya ya 🙏', true).catch(() => {});
+        return showCheckoutConfirm(ctx, pend);
+      }
+    }
+    checkoutPending.delete(uid);
+    await ctx.answerCbQuery().catch(() => {});
+    await ctx.editMessageText('⏳ Membuat pembayaran…').catch(() => {});
+    await createOrderFromCart(ctx, pend.singleProd || null, pend.singleQty || 1, pend.priceOverride || null);
+  });
+  bot.action('co_tos', async (ctx) => {
+    const uid = ctx.from.id;
+    const pend = checkoutPending.get(uid);
+    if (!pend) { await ctx.answerCbQuery('Sesi checkout sudah berakhir').catch(() => {}); return; }
+    const { items } = coItems(uid, pend);
+    tosRecord(uid, items);
+    pend.tosOk = true;
+    await ctx.answerCbQuery('✅ Ketentuan disetujui — terima kasih!').catch(() => {});
+    return showCheckoutConfirm(ctx, pend);
+  });
+  bot.action('co_tos_read', async (ctx) => {
+    const uid = ctx.from.id;
+    const pend = checkoutPending.get(uid);
+    if (!pend) { await ctx.answerCbQuery('Sesi checkout sudah berakhir').catch(() => {}); return; }
+    const { items } = coItems(uid, pend);
+    const req = tosRequired(uid, items);
+    const list = req.length ? req : items.filter(({ p }) => String(p.tos_text || '').trim());
+    if (!list.length) { await ctx.answerCbQuery('Tidak ada ketentuan khusus').catch(() => {}); return; }
+    await ctx.answerCbQuery().catch(() => {});
+    const NL2 = String.fromCharCode(10, 10);
+    const full = list.map(({ p }) => '📜 <b>SYARAT & KETENTUAN — ' + esc(p.name) + '</b>' + NL2 + esc(String(p.tos_text).trim())).join(NL2 + '━━━━━━━━━━━━━━' + NL2);
+    const chunks = [];
+    let buf = '';
+    for (const part of full.split(NL2)) { if ((buf + NL2 + part).length > 3500 && buf) { chunks.push(buf); buf = part; } else buf = buf ? buf + NL2 + part : part; }
+    if (buf) chunks.push(buf);
+    for (let i = 0; i < chunks.length; i++) {
+      const last = i === chunks.length - 1;
+      await ctx.reply(chunks[i], { parse_mode: 'HTML', ...(last ? Markup.inlineKeyboard([[Markup.button.callback('✅ Saya Setuju', 'co_tos')], [Markup.button.callback('‹ Kembali ke Konfirmasi', 'co_back')]]) : {}) }).catch(() => {});
+    }
+  });
+  bot.action('co_voucher', (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    inputState.set(ctx.from.id, { mode: 'voucher', from: 'confirm' });
+    return ctx.reply(`${E.gift} <b>VOUCHER DISKON</b>\n${DIV}\n\nKetik kode voucher Anda:`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('Batal', 'co_back')]]) });
+  });
+  bot.action('co_back', async (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    const st = inputState.get(ctx.from.id);
+    if (st && st.mode === 'voucher') inputState.delete(ctx.from.id);
+    const pend = checkoutPending.get(ctx.from.id);
+    if (pend) return showCheckoutConfirm(ctx, pend);
+    return showCart(ctx);
+  });
+  bot.action('co_voucher_del', async (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    inputState.delete(ctx.from.id);
+    const pend = checkoutPending.get(ctx.from.id);
+    if (pend) return showCheckoutConfirm(ctx, pend);
+    return showCart(ctx);
+  });
+  bot.action('co_cancel', async (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    checkoutPending.delete(ctx.from.id);
+    try { await ctx.editMessageText(`${E.cross} <b>Checkout dibatalkan.</b>\n\n${divider('sparkle')}`, { parse_mode: 'HTML', ...backMenu }); }
+    catch (e) { return ctx.reply(`${E.cross} <b>Checkout dibatalkan.</b>`, { parse_mode: 'HTML', ...backMenu }); }
+  });
+  bot.action('gate_check', async (ctx) => {
+    const uid = ctx.from.id;
+    const isMem = ADMIN_IDS.includes(uid) || await channelMember(ctx.telegram, uid);
+    if (!isMem) {
+      return ctx.answerCbQuery('Hmm, sepertinya kamu belum join channel. Join dulu ya, lalu ketuk lagi tombol ini. 🙏', true).catch(() => {});
+    }
+    await ctx.answerCbQuery('✅ Keanggotaan terkonfirmasi!').catch(() => {});
+    const pend = gatePending.get(uid) || {};
+    gatePending.delete(uid);
+    checkoutPending.delete(uid);
+    await ctx.editMessageText('⏳ Membuat pembayaran…').catch(() => {});
+    await createOrderFromCart(ctx, pend.singleProd || null, pend.singleQty || 1, null);
+  });
+  bot.action(/^(paid):(.+)/, async (ctx) => {
+    const orderId = ctx.match[2];
+    await ctx.answerCbQuery('⏳ Mengecek pembayaran…').catch(() => {});
+    try {
+      const d = await qris.status(orderId);
+      const st = String(d.status || '').toUpperCase();
+      if (st === 'PAID' || st === 'SUCCESS' || st === 'SETTLED') {
+        await fulfillOrder(bot, orderId, d.paid_at);
+        await ctx.answerCbQuery('✅ Pembayaran terkonfirmasi!').catch(() => {});
+      } else {
+        await ctx.answerCbQuery('⏳ Belum terdeteksi. Tunggu sebentar lalu coba lagi.', true).catch(() => {});
+      }
+    } catch (e) { await ctx.answerCbQuery('❌ Gagal cek status. Coba lagi.', true).catch(() => {}); }
+  });
+  bot.action(/^(cancel):(.+)/, async (ctx) => {
+    const o = store.getOrder(ctx.match[2]);
+    if (!o) {
+      await ctx.answerCbQuery('Order tidak ditemukan', true).catch(() => {});
+      return;
+    }
+    if (o.status === 'pending') {
+      store.setOrderStatus(ctx.match[2], 'cancelled');
+      qrisMarkClosed(bot, o, `${E.cross} <b>PESANAN DIBATALKAN</b>`, 'Pembayaran dibatalkan oleh pembeli.');
+      await ctx.answerCbQuery('Order dibatalkan').catch(() => {});
+      await ctx.editMessageText(`${E.cross} <b>Order dibatalkan.</b>\n\n${divider('sparkle')}`, { parse_mode: 'HTML', ...backMenu }).catch(() => {});
+      return;
+    }
+    // VCC sudah dibayar tapi kartu belum diproses supplier → batalkan + refund otomatis ke saldo
+    if (o.status === 'paid' && ['pending_create', ''].includes(o.senna_state || '')) {
+      const items = store.db.prepare('SELECT * FROM order_items WHERE order_id=?').all(ctx.match[2]);
+      const isVcc = items.some(it => {
+        const p = store.getProduct(it.product_id);
+        return p && p.type === 'vcc';
+      });
+      if (!isVcc) {
+        await ctx.answerCbQuery('Order tidak bisa dibatalkan', true).catch(() => {});
+        return;
+      }
+      const ref = `cancel-${o.order_id}-v0`;
+      if (store.walletHasRef(ref)) {
+        await ctx.answerCbQuery('Order sudah dibatalkan sebelumnya', true).catch(() => {});
+        return;
+      }
+      store.setOrderStatus(ctx.match[2], 'cancelled');
+      store.markVccState(ctx.match[2], 'cancelled');
+      qrisMarkClosed(bot, o, `${E.cross} <b>PESANAN DIBATALKAN</b>`, `Refund ${rp(o.total)} dikirim ke saldo.`);
+      await refundToWallet(bot, ctx.match[2], ref, o.user_id, o.total, 'Order dibatalkan pembeli');
+      await ctx.answerCbQuery('Order dibatalkan — dana masuk saldo').catch(() => {});
+      await ctx.editMessageText(`${E.cross} <b>Order dibatalkan.</b>\n\n💸 Dana <b>${rp(o.total)}</b> sudah dikembalikan ke <b>saldo</b> kamu.\n\n${divider('sparkle')}`, { parse_mode: 'HTML', ...backMenu }).catch(() => {});
+      return;
+    }
+    if (o.status === 'paid' && o.senna_state === 'created') {
+      await ctx.answerCbQuery('Kartu sedang diproses supplier — tidak bisa dibatalkan otomatis. Hubungi admin.', true).catch(() => {});
+      return;
+    }
+    await ctx.answerCbQuery('Order tidak bisa dibatalkan', true).catch(() => {});
+  });
+  // ---- wallet actions ----
+  bot.action('menu_saldo', async (ctx) => { ctx.answerCbQuery().catch(() => {}); return showWallet(ctx); });
+  bot.action('saldo_topup', async (ctx) => { ctx.answerCbQuery().catch(() => {}); return showTopupPresets(ctx); });
+  bot.action('saldo_topup_custom', async (ctx) => {
+    await ctx.answerCbQuery('Nominal bebas sudah tidak tersedia').catch(() => {});
+    return showTopupPresets(ctx);
+  });
+  bot.action(/^isaldo:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    return createTopup(ctx, ctx.from.id, Number(ctx.match[1]));
+  });
+  bot.action(/^tppaid:(.+)$/, async (ctx) => topupPaid(ctx, ctx.match[1]));
+  bot.action(/^tpcancel:(.+)$/, async (ctx) => {
+    const t = store.walletGetTopup(ctx.match[1]);
+    const ok = store.walletSetTopupStatus(ctx.match[1], 'cancelled');
+    if (ok && t) topupMarkClosed(bot, t, `${E.cross} <b>ISI SALDO DIBATALKAN</b>`, 'Topup dibatalkan oleh pembeli.');
+    await ctx.answerCbQuery(ok ? 'Topup dibatalkan' : 'Tidak bisa dibatalkan').catch(() => {});
+    await ctx.editMessageText(`${E.cross} <b>Isi saldo dibatalkan.</b>\n\n${divider('sparkle')}`, { parse_mode: 'HTML', ...backMenu }).catch(() => {});
+  });
+  bot.action(/^saldopay:(.+)$/, async (ctx) => {
+    const orderId = ctx.match[1];
+    const o = store.getOrder(orderId);
+    if (!o || o.status !== 'pending') return ctx.answerCbQuery('Order sudah diproses', true).catch(() => {});
+    try {
+      store.walletTx(o.user_id, 'use', -Math.round(Number(o.total)), orderId, `Pembayaran ${orderId}`);
+    } catch (e) {
+      return ctx.answerCbQuery('Saldo tidak cukup — order dibatalkan?', true).catch(() => {});
+    }
+    await ctx.answerCbQuery('⏳ Memproses pesanan…').catch(() => {});
+    try { await ctx.editMessageText(`${E.check} <b>Pembayaran dengan saldo berhasil.</b>`, { parse_mode: 'HTML' }).catch(() => {}); } catch (e) {}
+    await fulfillOrder(bot, orderId, new Date().toISOString());
+  });
+  bot.action(/^qrinstead:(.+)$/, async (ctx) => {
+    const orderId = ctx.match[1];
+    const o = store.getOrder(orderId);
+    if (!o || o.status !== 'pending') return ctx.answerCbQuery('Order sudah diproses', true).catch(() => {});
+    const publicUrl = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
+    let qd;
+    try {
+      qd = await qris.create({ orderId, amount: Number(o.total), keterangan: `Order ${orderId} - ${SHOP()}`.slice(0, 60), callbackUrl: publicUrl ? `${publicUrl}/webhook/qris` : '' });
+    } catch (e) { return ctx.answerCbQuery('❌ Gagal membuat QRIS. Coba lagi.', true).catch(() => {}); }
+    const expiredAt = qd.expired_at || o.expired_at;
+    store.db.prepare('UPDATE orders SET qris_image=?, qris_url=?, expired_at=?, signature=?, total=? WHERE order_id=?')
+      .run('', qd.qris_url || '', expiredAt, qd.signature || '', Number(qd.total_amount || o.total), orderId);
+    await ctx.answerCbQuery();
+    return sendQrisMessage(ctx, store.getOrder(orderId), qd);
+  });
+  bot.action(/^orders(?::(\d+))?$/, (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    return renderOrders(ctx, Number(ctx.match[1]) || 1, true);
+  });
+  bot.action(/^(order):(.+)/, async (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    const o = store.getOrder(ctx.match[2]);
+    if (!o || o.user_id !== ctx.from.id) return ctx.answerCbQuery('Tidak ditemukan');
+    const sb = stepsBlock(o.status);
+    let text = `${divider('sparkle')}\n\n${STATUS_EMOJI[o.status] || ''} <b>${STATUS_LABEL[o.status] || o.status}</b>\n\n`
+      + box([
+        `${E.ticket} No. Order ─ <code>${o.order_id}</code>`,
+        `${E.package} Produk ─ ${esc(o.product_name)}`,
+        `${E.money} Total ─ <b>${rp(o.total)}</b>`,
+        `${E.cal} Tanggal ─ ${new Date(o.created_at + 'Z').toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}`,
+      ])
+      + `\n\n${sb.bar}\n${sb.lines}`;
+    if (o.status === 'paid' && o.delivered_content) text += `\n\n${divider('dot')}\n<b>PRODUK ANDA</b>\n${divider('dot')}\n${o.delivered_content}`;
+    if (o.status === 'paid' && !o.rating) text += `\n\n${divider('dot')}\n${E.star} Berikan penilaian Anda:`;
+    text += `\n\n${divider('sparkle')}`;
+    const kb = [];
+    if (o.status === 'pending') kb.push([Markup.button.callback('🔍 Cek Status Bayar', `paid:${o.order_id}`)]);
+    if (o.status === 'paid' && !o.rating) kb.push([
+      Markup.button.callback('⭐', `rate:${o.order_id}:1`), Markup.button.callback('⭐⭐', `rate:${o.order_id}:2`),
+      Markup.button.callback('⭐⭐⭐', `rate:${o.order_id}:3`), Markup.button.callback('⭐⭐⭐⭐', `rate:${o.order_id}:4`),
+      Markup.button.callback('⭐⭐⭐⭐⭐', `rate:${o.order_id}:5`),
+    ]);
+    kb.push([Markup.button.callback('‹ Kembali', 'orders')]);
+    await ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(kb) });
+  });
+
+  // ─── new pages ───
+  bot.action(/^menu_flash(?::(\d+))?$/, (ctx) => { ctx.answerCbQuery().catch(() => {}); return renderFlash(ctx, Number(ctx.match[1]) || 1); });
+  bot.action(/^menu_testimoni(?::(\d+))?$/, (ctx) => { ctx.answerCbQuery().catch(() => {}); return renderTestimonials(ctx, Number(ctx.match[1]) || 1); });
+  bot.action('menu_profil', (ctx) => { ctx.answerCbQuery().catch(() => {}); return renderProfile(ctx); });
+
+  // ─── partner / app premium ───
+  bot.action(/^menu_partners(?::(\d+))?$/, (ctx) => { ctx.answerCbQuery().catch(() => {}); return renderPartners(ctx, Number(ctx.match[1]) || 1); });
+  bot.action(/^partner:([^:]+)(?::(\d+))?$/, (ctx) => { ctx.answerCbQuery().catch(() => {}); return renderPartnerDetail(ctx, ctx.match[1], Number(ctx.match[2]) || 1); });
+
+  // ─── snk (syarat & ketentuan) ───
+  bot.action('menu_snk', (ctx) => { ctx.answerCbQuery().catch(() => {}); return showSnk(ctx); });
+  bot.action('tnc_ok', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    store.tncAccept(ctx.from.id);
+    const text = `${divider('sparkle')}\n\n${E.check} <b>TERIMA KASIH!</b>\n${DIV}\n\nKetentuan sudah disetujui dan tersimpan.\nSilakan lanjut belanja dengan nyaman. ${E.spark}\n\n<i>Kalau tadi terputus saat checkout, tinggal ketuk lagi tombol <b>Checkout/Beli</b> ya.</i>\n\n${divider('sparkle')}`;
+    return ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+      [Markup.button.callback(`${E.cart} Keranjang`, 'cart')],
+      [Markup.button.callback('‹ Menu Utama', 'menu')],
+    ]) }).catch(() => {});
+  });
+
+  // ─── rating & review ───
+  bot.action(/^(rate):(.+):([1-5])/, async (ctx) => {
+    const orderId = ctx.match[2];
+    const n = Number(ctx.match[3]);
+    const o = store.getOrder(orderId);
+    if (!o || o.user_id !== ctx.from.id) return ctx.answerCbQuery('Tidak ditemukan', true);
+    store.db.prepare('UPDATE orders SET rating=? WHERE order_id=?').run(n, orderId);
+    inputState.set(ctx.from.id, { mode: 'review', data: { orderId } });
+    await ctx.answerCbQuery(`⭐ ${n}/5 tersimpan`).catch(() => {});
+    await ctx.reply(`${divider('sparkle')}\n\n   ${E.star} <b>BERI TESTIMONI</b>\n\n${divider('single')}\n\nRating: <b>${'⭐'.repeat(n)}</b> (${n}/5)\n\nKetik testimoni singkat Anda,\natau ketik <code>/skip</code> untuk lewati.\n\n${divider('sparkle')}`, { parse_mode: 'HTML' });
+  });
+
+  // ─── support ticket ───
+  bot.action('cs', async (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    store.openTicket(ctx.from.id);
+    inputState.set(ctx.from.id, { mode: 'ticket' });
+    await ctx.reply(`${E.inbox} <b>CHAT ADMIN</b>\n\n${String(store.getSetting('help_text', 'Ketik pesan kamu di bawah, admin akan membalas secepatnya.'))}`, { parse_mode: 'HTML' });
+  });
+  bot.action('help', (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    store.openTicket(ctx.from.id);
+    inputState.set(ctx.from.id, { mode: 'ticket' });
+    return ctx.reply(`${E.inbox} <b>CHAT ADMIN</b>\n\n${String(store.getSetting('help_text', 'Ketik pesan kamu di bawah, admin akan membalas secepatnya.'))}`, { parse_mode: 'HTML' });
+  });
+  bot.action(/^(csreply):(\d+)/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('⛔');
+    await ctx.answerCbQuery().catch(() => {});
+    inputState.set(ctx.from.id, { mode: 'ticketreply', data: { ticketId: Number(ctx.match[2]) } });
+    await ctx.reply(`✉️ <b>Balas ticket #${ctx.match[2]}</b>\n\nKetik balasan kamu:`, { parse_mode: 'HTML' });
+  });
+
+  // text input states
+  bot.command('batal', (ctx) => { inputState.delete(ctx.from.id); return ctx.reply('✅ Dibatalkan.', { parse_mode: 'HTML', ...mainMenu(ctx.from.id) }); });
+  bot.on('text', async (ctx) => {
+    const uid = ctx.from.id;
+    store.upsertUser(uid, ctx.from.username, ctx.from.first_name);
+    const st = inputState.get(uid);
+    if (!st) return;
+    const txt = ctx.message.text || '';
+
+    if (st.mode === 'saldo_topup') {
+      inputState.delete(uid);
+      return ctx.reply(`${E.cross} Nominal bebas sudah tidak tersedia. Silakan pilih nominal isi saldo yang tersedia (min. ${rp(5000)}) lewat menu Saldo.`, { parse_mode: 'HTML', ...backMenu });
+    }
+    if (st.mode === 'search') {
+      inputState.delete(uid);
+      const res = store.searchProducts(txt);
+      if (!res.length) return ctx.reply(`${E.cross} Tidak ketemu produk "<b>${esc(txt)}</b>".`, { parse_mode: 'HTML', ...backMenu });
+      const sid = String(Date.now() % 1e8) + String(uid % 1000);
+      searchCache.set(sid, { t: Date.now(), q: txt, res });
+      for (const [k, v] of searchCache) if (Date.now() - v.t > 3600e3) searchCache.delete(k);
+      return renderSearch(ctx, sid, 1, false);
+    }
+    if (st.mode === 'voucher') {
+      const v = store.getVoucher(txt.trim());
+      let amount = 0;
+      const coPend = checkoutPending.get(uid);
+      if (coPend) amount = coItems(uid, coPend).amount;
+      else { const cart = getCart(uid); for (const [pid, qty] of cart) { const p = store.getProduct(pid); if (p) amount += p.price * qty; } }
+      if (!v) { inputState.delete(uid); return ctx.reply(`${E.cross} Kode voucher tidak valid.`, { parse_mode: 'HTML', ...backMenu }); }
+      if (v.quota && v.used >= v.quota) { inputState.delete(uid); return ctx.reply(`${E.cross} Voucher sudah habis.`, { parse_mode: 'HTML', ...backMenu }); }
+      if (amount < (v.min_amount || 0)) { inputState.delete(uid); return ctx.reply(`${E.cross} Minimal belanja ${rp(v.min_amount)} untuk voucher ini.`, { parse_mode: 'HTML', ...backMenu }); }
+      const disc = v.kind === 'percent' ? Math.round(amount * v.value / 100) : Math.min(v.value, amount);
+      inputState.set(uid, { mode: 'voucher_ok', data: { code: v.code } });
+      if (coPend) return showCheckoutConfirm(ctx, coPend, false);
+      return ctx.reply(`${E.check} <b>Voucher ${esc(v.code)} dipakai!</b>\n\n${box([`${E.tag} Diskon ─ ${rp(disc)}`])}\n\n<i>Diskon dihitung saat checkout.</i>`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🛒 Kembali ke Keranjang', 'cart')]]) });
+    }
+    if (st.mode === 'ticket') {
+      const t = store.openTicket(uid);
+      store.db.prepare('INSERT INTO ticket_msgs(ticket_id,from_admin,text) VALUES(?,?,?)').run(t.id, 0, txt);
+      inputState.delete(uid);
+      await ctx.reply(`${E.check} <b>Pesan terkirim ke admin.</b> Tunggu balasannya ya 🙏`, { parse_mode: 'HTML', ...backMenu });
+      for (const aid of ADMIN_IDS) {
+        ctx.telegram.sendMessage(aid, `💬 <b>Ticket #${t.id}</b> dari ${esc(ctx.from.first_name)} (@${esc(ctx.from.username || '-')})\n\n${esc(txt)}`,
+          { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('✉️ Balas', `csreply:${t.id}`)]]) }).catch(() => {});
+      }
+      return;
+    }
+    if (st.mode === 'ticketreply' && isAdmin(ctx)) {
+      const ticketId = st.data.ticketId;
+      const t = store.db.prepare('SELECT * FROM tickets WHERE id=?').get(ticketId);
+      inputState.delete(uid);
+      if (!t) return ctx.reply('Ticket tidak ditemukan.');
+      store.db.prepare('INSERT INTO ticket_msgs(ticket_id,from_admin,text) VALUES(?,?,?)').run(ticketId, 1, txt);
+      await ctx.telegram.sendMessage(t.user_id, `💬 <b>Balasan Admin:</b>\n\n${esc(txt)}`, { parse_mode: 'HTML', ...backMenu }).catch(() => {});
+      return ctx.reply('✅ Balasan terkirim.');
+    }
+    if (st.mode === 'review') {
+      const review = txt.trim() === '/skip' ? '' : txt.trim().slice(0, 500);
+      store.db.prepare('UPDATE orders SET review=? WHERE order_id=? AND user_id=?').run(review, st.data.orderId, uid);
+      inputState.delete(uid);
+      return ctx.reply(`${divider('sparkle')}\n\n${E.check} <b>Terima kasih atas testimoni Anda!</b> ${E.heart}\n\n${review ? `${E.heart} <i>"${esc(review)}"</i>` : `${E.pray} Masukan Anda sangat berharga.`}\n\nSampai jumpa di order berikutnya! ${E.wink}\n\n${divider('sparkle')}`,
+        { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+          [Markup.button.callback('🛍️ Belanja Lagi', 'cats')],
+          [Markup.button.callback('‹ Menu Utama', 'menu')],
+        ]) });
+    }
+  });
+
+  // payment poller
+  async function pollPayments() {
+    for (const o of store.pendingOrders()) {
+      try {
+        if (o.expired_at && new Date(o.expired_at) < new Date()) { store.setOrderStatus(o.order_id, 'expired'); qrisMarkClosed(bot, o, `${E.cross} <b>PEMBAYARAN KEDALUARSA</b>`, 'QR tidak berlaku lagi. Buat order baru bila masih berminat.'); continue; }
+        if (!o.qris_url) continue; // order via saldo, belum pakai QR
+        const d = await qris.status(o.order_id);
+        const st = String(d.status || '').toUpperCase();
+        if (st === 'PAID' || st === 'SUCCESS' || st === 'SETTLED') await fulfillOrder(bot, o.order_id, d.paid_at);
+      } catch (e) { /* retry next round */ }
+    }
+    for (const t of store.walletPendingTopups()) {
+      try {
+        if (t.expired_at && new Date(t.expired_at) < new Date()) {
+          store.walletSetTopupStatus(t.topup_id, 'expired');
+          topupMarkClosed(bot, t, `${E.cross} <b>ISI SALDO KEDALUARSA</b>`, 'QR tidak berlaku lagi. Buat topup baru bila masih berminat.');
+          continue;
+        }
+        const d = await qris.status(t.topup_id);
+        const st = String(d.status || '').toUpperCase();
+        if (st === 'PAID' || st === 'SUCCESS' || st === 'SETTLED') {
+          if (store.walletCreditTopup(t.topup_id)) {
+            topupMarkClosed(bot, t, `${E.check} <b>ISI SALDO BERHASIL</b>`, `Saldo bertambah ${rp(t.amount)}.`);
+            bot.telegram.sendMessage(t.user_id, `${E.money} <b>Isi saldo ${rp(t.amount)} BERHASIL!</b>\n\n<i>Saldo siap dipakai belanja.</i>\n\n${divider('sparkle')}`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('💰 Lihat Saldo', 'menu_saldo')], [Markup.button.callback('‹ Menu Utama', 'menu')]]) }).catch(() => {});
+          }
+        }
+      } catch (e) { /* retry next round */ }
+    }
+  }
+  setInterval(pollPayments, 30000);
+
+  // bangkitkan ulang retry VCC yang kehilangan timer (mis. pm2 restart)
+  const reviveVcc = () => {
+    try {
+      const rows = store.db.prepare("SELECT * FROM orders WHERE status='paid' AND senna_state IN ('pending_create','created') AND created_at > datetime('now','-24 hours')").all();
+      for (const o of rows) {
+        const items = store.db.prepare('SELECT * FROM order_items WHERE order_id=?').all(o.order_id);
+        for (let idx = 0; idx < items.length; idx++) {
+          const it = items[idx];
+          const p = store.getProduct(it.product_id);
+          if (!p || p.type !== 'vcc') continue;
+          const exId = `${o.order_id}${idxSuffix(idx)}`.slice(0, 80);
+          const hasCard = String(o.delivered_content || '').includes('💳 <b>Nomor');
+          if ((o.senna_state === 'created') && hasCard) { store.markVccState(o.order_id, 'done'); continue; }
+          console.log(`[vcc-revive] ${o.order_id} state=${o.senna_state}`);
+          if (o.senna_state === 'pending_create') scheduleVccCreateRetry(bot, o.order_id, exId, it, p, (p.description || p.name || 'VCC').slice(0, 200));
+          else scheduleVccRetry(bot, o.order_id, exId, it);
+        }
+      }
+    } catch (e) { console.error('[vcc-revive]', e.message); }
+  };
+  setTimeout(reviveVcc, 10000);
+
+  // link bot resmi (refresh username via getMe)
+  bot.telegram.getMe().then((me) => { SHOP_BOT_LINK = 'https://t.me/' + me.username; }).catch(() => {});
+
+  // iklan rotasi otomatis ke channel (interval via setting ads_interval_min, 0=off)
+  let adsCounter = 0;
+  setInterval(async () => {
+    try {
+      adsCounter++;
+      const iv = Number(store.getSetting('ads_interval_min', '240'));
+      if (!iv || iv <= 0 || adsCounter < iv) return;
+      adsCounter = 0;
+      if (!notify.target()) return;
+      const prods = store.allProducts().filter((p) => p.is_active === 1);
+      if (!prods.length) return;
+      const picks = [];
+      for (let k = 0; k < Math.min(3, prods.length); k++) picks.push(prods[(adsIdx + k) % prods.length]);
+      adsIdx = (adsIdx + 3) % prods.length;
+      const lines = picks.map((p) => {
+        const stok = p.stock_n > 0 ? `${p.stock_n} stok siap` : (p.type === 'vcc' ? 'terbit otomatis' : 'order via admin');
+        return `${E.card} <b>${esc(p.name)}</b> ─ <b>${rp(p.price)}</b>\n<i>   ${esc(p.cat_name || '')} · ${stok}</i>`;
+      });
+      let photo = null;
+      const p0 = picks[0];
+      if (p0.photo_url) photo = /^https?:/i.test(p0.photo_url) ? p0.photo_url : (process.env.PUBLIC_URL ? process.env.PUBLIC_URL.replace(/\/+$/, '') + p0.photo_url : null);
+      notify.notify(`${E.bag} <b>${esc(SHOP())}</b> — ${esc(TAGLINE() || 'Belanja mudah 24 jam')}
+
+${lines.join('\n\n')}
+
+${E.arrow} Order langsung di bot: ${shopBotLink()}
+${E.info} Pembayaran QRIS instan, saldo wallet juga bisa`, photo || undefined);
+    } catch (e) { console.error('[ads]', e.message); }
+  }, 60000);
+
+// command menu
+bot.telegram.setMyCommands([
+  { command: 'start', description: 'Menu utama' },
+  { command: 'katalog', description: 'Lihat katalog produk' },
+  { command: 'cari', description: 'Cari produk' },
+  { command: 'keranjang', description: 'Lihat keranjang' },
+  { command: 'pesanan', description: 'Riwayat pesanan' },
+  { command: 'bantuan', description: 'Hubungi admin' },
+]).catch(() => {});
+
+  // auto-deteksi chat saat bot ditambahkan ke channel/grup (lihat log untuk chat id)
+  bot.on('my_chat_member', (ctx) => {
+    try {
+      const c = ctx.myChatMember.chat;
+      const me = ctx.myChatMember.new_chat_member || {};
+      console.log(`[chat-detect] type=${c.type} id=${c.id} title=${c.title || c.first_name || ''} status=${me.status}`);
+    } catch (e) {}
+  });
+
+  return bot;
+}
+
+module.exports = { setupBot, fulfillOrder };

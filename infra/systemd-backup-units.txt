@@ -1,0 +1,66 @@
+# /etc/systemd/system/armshop-backup-db.service
+[Unit]
+Description=Armshop - backup database per jam
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/home/ubuntu/armshop-backup/backup-db.sh
+
+# /etc/systemd/system/armshop-backup-db.timer
+[Unit]
+Description=Jalankan backup database armshop tiap jam
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=armshop-backup-db.service
+
+[Install]
+WantedBy=timers.target
+
+# /etc/systemd/system/armshop-backup-sync.service
+[Unit]
+Description=Armshop - sinkron backup harian ke GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/home/ubuntu/armshop-backup/sync-github.sh
+
+# /etc/systemd/system/armshop-backup-sync.timer
+[Unit]
+Description=Sinkron backup armshop ke GitHub harian 03:30 WIB
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 Asia/Jakarta
+Persistent=true
+Unit=armshop-backup-sync.service
+
+[Install]
+WantedBy=timers.target
+
+# /etc/systemd/system/armshop-backup-full.service
+[Unit]
+Description=Armshop - snapshot penuh mingguan (lokal)
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/home/ubuntu/armshop-backup/full-backup.sh
+
+# /etc/systemd/system/armshop-backup-full.timer
+[Unit]
+Description=Snapshot penuh armshop mingguan (Minggu 04:00 WIB)
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00 Asia/Jakarta
+Persistent=true
+Unit=armshop-backup-full.service
+
+[Install]
+WantedBy=timers.target

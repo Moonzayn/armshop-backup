@@ -56,6 +56,59 @@ app.post('/webhook/qris', async (req, res) => {
   res.status(200).send('OK'); // selalu 200 agar tidak di-retry
 });
 
+
+// ---- Senna OTP relay (listener Telegram -> DM pembeli pemilik kartu) ----
+app.post('/webhook/senna-otp', async (req, res) => {
+  try {
+    const secret = process.env.SENNA_OTP_SECRET || '';
+    if (!secret || (req.headers['x-otp-secret'] || '') !== secret) return res.status(403).json({ ok: false });
+    const { code, last4, message } = req.body || {};
+    if (!/^\d{4,8}$/.test(String(code || '')) || !/^\d{4}$/.test(String(last4 || ''))) {
+      return res.status(400).json({ ok: false, error: 'payload tidak valid' });
+    }
+    const escO = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // kandidat: order lunas berisi kartu terdeliver yang nomornya berakhiran last4
+    const rows = store.db.prepare(
+      "SELECT order_id, user_id, delivered_content FROM orders WHERE user_id > 0 AND status='paid' AND delivered_content != '' ORDER BY paid_at DESC LIMIT 800"
+    ).all();
+    const cands = [];
+    for (const r of rows) {
+      const nums = String(r.delivered_content).match(/\d[\d\s-]{11,}\d/g) || [];
+      if (nums.some((n) => { const d = n.replace(/\D/g, ''); return d.length >= 13 && d.endsWith(String(last4)); })) cands.push(r);
+    }
+    const target = cands.length === 1 ? cands[0] : null;
+    try {
+      store.db.prepare('INSERT INTO otp_logs (order_id, user_id, last4, code, message, matched) VALUES (?,?,?,?,?,?)')
+        .run(target ? target.order_id : null, target ? target.user_id : null, String(last4), String(code), String(message || '').slice(0, 1000), target ? 1 : 0);
+    } catch (e) { /* tabel belum ada -> abaikan log */ }
+    const bot = global._bot;
+    if (bot && target) {
+      await bot.telegram.sendMessage(target.user_id,
+        '🔐 <b>Kode OTP untuk kartu kamu (****' + last4 + ')</b>\n\n<code>' + code + '</code>\n\n📨 ' + escO(message) + '\n\n<i>Masukkan kode ini di halaman pembayaran sekarang — masa berlakunya singkat.</i>',
+        { parse_mode: 'HTML' }).catch(() => {});
+      console.log('[senna-otp] terkirim ke pembeli order', target.order_id);
+    } else if (bot && cands.length > 1) {
+      // kartu cocok dengan data kita tapi pemiliknya ambigu -> admin teruskan manual
+      const ids = (process.env.ADMIN_IDS || '').split(',').map((s) => Number(s.trim())).filter(Boolean);
+      const candLine = '\nKandidat order: ' + cands.map((c) => c.order_id + ' (user ' + c.user_id + ')').join(', ');
+      for (const aid of ids) {
+        await bot.telegram.sendMessage(aid,
+          '🔐 <b>OTP Senna TIDAK terkirim otomatis</b>\n\nKode: <code>' + code + '</code>\nKartu: ****' + last4 + '\n📨 ' + escO(message) + candLine + '\n\n<i>Lebih dari satu pembeli cocok — teruskan manual ke yang benar.</i>',
+          { parse_mode: 'HTML' }).catch(() => {});
+      }
+      console.log('[senna-otp] ambigu -> admin, kandidat:', cands.length);
+    } else {
+      // tidak ada kandidat: kemungkinan besar OTP pembeli reseller Senna lain
+      // -> catat diam-diam di otp_logs, jangan ganggu admin (keputusan user 23 Okt)
+      console.log('[senna-otp] tanpa kandidat — dicatat diam-diam (****' + last4 + ')');
+    }
+    return res.json({ ok: true, matched: target ? 1 : 0, candidates: cands.length });
+  } catch (e) {
+    console.error('[senna-otp]', e.message);
+    return res.status(200).json({ ok: false });
+  }
+});
+
 const auth = (req, res, next) => {
   const t = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith('sess='));
   if (t && sessions.has(t.slice(5))) return next();
@@ -82,7 +135,15 @@ app.post('/api/logout', (req, res) => {
 /* ===== Storefront publik (armshop.my.id) =====
    Semua produk aktif ditampilkan di etalase web.
    Katakan mau mengecualikan kategori tertentu? Tambahkan id-nya di Set di bawah. */
-const STOREFRONT_BLOCKED_CATS = new Set([]);
+const STOREFRONT_BLOCKED_CATS = new Set([
+  'cat-5819de', // VCC
+  'cat-a1f78f', // Akun Murah
+  'cat-4e7c36', // Gmail Education
+  'cat-1cf27b', // Jasa 2FA Gmail
+  'ai_tools',   // AI & Productivity (refill/akun)
+  'cat-c70404', // VPN (akun shared)
+  'streaming', 'games', 'design',
+]);
 function storefrontSlug(name, id) {
   const base = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
   return (base || 'produk') + '-' + String(id).toLowerCase();
@@ -134,6 +195,7 @@ app.get('/api/storefront', (req, res) => {
           description: desc || p.name,
           price: promoP || p.price,
           originalPrice: promoP ? p.price : null,
+          tosText: String(p.tos_text || ''),
           sold: soldMap[p.id] || 0,
           stock,
           delivery: isVcc
@@ -343,9 +405,9 @@ app.post('/api/products', (req, res) => {
   const b = req.body;
   const id = b.id || ('PRD-' + crypto.randomBytes(4).toString('hex').toUpperCase());
   const isNew = !store.db.prepare('SELECT 1 FROM products WHERE id=?').get(id);
-  store.db.prepare(`INSERT INTO products(id,category_id,name,description,price,type,photo_url,is_active,sort,senna_product_id)
-    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET category_id=excluded.category_id,name=excluded.name,description=excluded.description,price=excluded.price,type=excluded.type,photo_url=excluded.photo_url,is_active=excluded.is_active,sort=excluded.sort,senna_product_id=excluded.senna_product_id`)
-    .run(id, b.category_id || '', b.name, b.description || '', Number(b.price) || 0, b.type || 'digital', b.photo_url || '', b.is_active ? 1 : 0, Number(b.sort) || 0, b.senna_product_id || '');
+  store.db.prepare(`INSERT INTO products(id,category_id,name,description,price,type,photo_url,is_active,sort,senna_product_id,tos_text)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET category_id=excluded.category_id,name=excluded.name,description=excluded.description,price=excluded.price,type=excluded.type,photo_url=excluded.photo_url,is_active=excluded.is_active,sort=excluded.sort,senna_product_id=excluded.senna_product_id,tos_text=excluded.tos_text`)
+    .run(id, b.category_id || '', b.name, b.description || '', Number(b.price) || 0, b.type || 'digital', b.photo_url || '', b.is_active ? 1 : 0, Number(b.sort) || 0, b.senna_product_id || '', String(b.tos_text || '').slice(0, 2000));
   if (isNew) notify.announceProduct(store.getProduct(id));
   res.json({ ok: true, id });
 });
@@ -1051,6 +1113,7 @@ async function prodForm(id){
 '<div id="f-prev">'+(p.photo_url?'<img src="'+esc(p.photo_url)+'" style="max-height:90px;border-radius:8px;margin-bottom:10px">':'')+'</div>'+
 
  '<label class="fl">Deskripsi</label><textarea id="f-desc" rows="4">'+esc(p.description||'')+'</textarea>'+
+ '<label class="fl">Ketentuan khusus produk (TOS) — opsional</label><textarea id="f-tos" rows="3" placeholder="Bila diisi, pembeli wajib menyetujuinya sebelum bayar (sekali per produk, selanjutnya diingat)">'+esc(p.tos_text||'')+'</textarea>'+
  '<div class="mfoot"><button class="btn ghost" onclick="closeModal()">Batal</button><button class="btn" onclick="saveProd(\\''+(id||'')+'\\')">Simpan</button></div>');
 }
 async function saveProd(id){const f=document.getElementById('f-file');
@@ -1058,7 +1121,7 @@ if(f&&f.files.length){const fd=new FormData();fd.append('photo',f.files[0]);
 document.getElementById('f-upmsg').textContent='Mengunggah…';
 const ur=await fetch('/api/upload',{method:'POST',body:fd});const uj=await ur.json();
 if(uj.ok){document.getElementById('f-photo').value=uj.url;document.getElementById('f-upmsg').textContent='Terunggah.';}else{document.getElementById('f-upmsg').textContent='Gagal: '+uj.error;return;}}
-const b={name:document.getElementById('f-name').value,price:document.getElementById('f-price').value,type:document.getElementById('f-type').value,senna_product_id:document.getElementById('f-senna').value||'',category_id:document.getElementById('f-cat').value,photo_url:document.getElementById('f-photo').value,description:document.getElementById('f-desc').value,is_active:1};if(id)b.id=id;await api('POST','/api/products',b);closeModal();loadProducts();}
+const b={name:document.getElementById('f-name').value,price:document.getElementById('f-price').value,type:document.getElementById('f-type').value,senna_product_id:document.getElementById('f-senna').value||'',category_id:document.getElementById('f-cat').value,photo_url:document.getElementById('f-photo').value,description:document.getElementById('f-desc').value,tos_text:(document.getElementById('f-tos')||{}).value||'',is_active:1};if(id)b.id=id;await api('POST','/api/products',b);closeModal();loadProducts();}
 function catForm(){
  openModal('<h3>Kelola Kategori</h3><p style="color:var(--muted);font-size:12px;margin-bottom:10px">Sembunyikan kategori dari katalog bot tanpa menghapus produknya.</p>'+window._cats.map(c=>'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border)"><span>'+esc(c.name)+(c.is_active?'':' <span class="badge b-cancelled">Disembunyikan</span>')+'</span><span><button class="btn sm ghost" onclick="toggleCat(\\''+c.id+'\\')">'+(c.is_active?'Sembunyikan':'Tampilkan')+'</button> <button class="btn sm ghost" onclick="editCatForm(\\''+c.id+'\\')">Ubah</button> <button class="btn sm danger" onclick="delCat(\\''+c.id+'\\')">Hapus</button></span></div>').join('')+'<br><label class="fl">Kategori baru</label><input id="c-name" placeholder="Nama kategori"><div class="mfoot"><button class="btn ghost" onclick="closeModal()">Tutup</button><button class="btn" onclick="saveCat()">Tambah</button></div>');
 }
@@ -1310,8 +1373,51 @@ async function hookBroadcastX(){
   host.appendChild(card);
 }
 
+
+// ---------- TEMPLATE TOS ----------
+var tosTplX=[];
+window.tosTplLoadX=async function(){ var st=await api('GET','/api/settings'); try{ tosTplX=JSON.parse((st&&st.tos_templates)||'[]'); }catch(e){ tosTplX=[]; } if(!Array.isArray(tosTplX)) tosTplX=[]; return tosTplX; };
+window.tosTplSaveAllX=async function(){ await api('POST','/api/settings',{tos_templates:JSON.stringify(tosTplX)}); };
+function hookSettingsX(){
+  var host=$('p-settings'); if(!host||$('tos-tpl-x')) return;
+  if(!host.querySelector('.card')) return;
+  var card=document.createElement('div'); card.className='card'; card.id='tos-tpl-x';
+  card.innerHTML='<h3>Template Syarat & Ketentuan (TOS)</h3><p style="color:var(--muted);font-size:12.5px;margin:-6px 0 14px">Template dipakai ulang untuk produk yang butuh persetujuan ketentuan khusus (mis. VPS/RDP). Di form produk, pilih template untuk mengisi kolom TOS otomatis — teksnya masih bisa disunting per produk. Produk tanpa TOS tidak menampilkan langkah persetujuan apa pun.</p><div id="tos-tpl-list"><div class="empty">Memuat…</div></div><button class="btn" onclick="tosTplFormX(-1)">+ Tambah Template</button>';
+  host.appendChild(card);
+  tosTplRenderX();
+}
+window.tosTplRenderX=async function(){
+  var list=$('tos-tpl-list'); if(!list) return;
+  await tosTplLoadX();
+  if(!tosTplX.length){ list.innerHTML='<div class="empty">Belum ada template.</div>'; return; }
+  list.innerHTML='<table style="margin-bottom:14px"><tr><th>Nama Template</th><th>Isi</th><th style="text-align:right">Aksi</th></tr>'+tosTplX.map(function(t,i){ return '<tr><td><b>'+esc(t.name)+'</b></td><td style="color:var(--muted)">'+(t.text||'').length+' karakter</td><td style="text-align:right;white-space:nowrap"><button class="btn sm ghost" onclick="tosTplFormX('+i+')">Ubah</button> <button class="btn sm danger" onclick="tosTplDelX('+i+')">Hapus</button></td></tr>'; }).join('')+'</table>';
+};
+window.tosTplFormX=function(i){
+  var t=i>=0?tosTplX[i]:{name:'',text:''};
+  openModal('<h3>'+(i>=0?'Ubah Template TOS':'Tambah Template TOS')+'</h3>'+
+  '<label class="fl">Nama template</label><input id="tt-name" value="'+esc(t.name||'')+'" placeholder="mis. Pembelian VPS/RDP">'+
+  '<label class="fl">Isi syarat & ketentuan</label><textarea id="tt-text" rows="12">'+esc(t.text||'')+'</textarea>'+
+  '<div class="mfoot"><button class="btn ghost" onclick="closeModal()">Batal</button><button class="btn" onclick="tosTplSaveX('+i+')">Simpan Template</button></div>');
+};
+window.tosTplSaveX=async function(i){
+  var name=($('tt-name')||{}).value||''; var text=($('tt-text')||{}).value||'';
+  if(!name.trim()||!text.trim()){ showToast('Nama dan isi template wajib diisi'); return; }
+  if(i>=0) tosTplX[i]={id:tosTplX[i].id||('tpl'+i),name:name.trim(),text:text}; else tosTplX.push({id:'tpl'+Date.now(),name:name.trim(),text:text});
+  await tosTplSaveAllX(); closeModal(); showToast('Template TOS disimpan'); tosTplRenderX();
+};
+window.tosTplDelX=async function(i){ if(!confirm('Hapus template ini? Produk yang sudah memakai teksnya tidak ikut berubah.'))return; tosTplX.splice(i,1); await tosTplSaveAllX(); showToast('Template dihapus'); tosTplRenderX(); };
+async function hookProdFormX(){
+  var ta=$('f-tos'); if(!ta||$('f-tos-tpl')) return;
+  await tosTplLoadX(); if(!tosTplX.length||$('f-tos-tpl')) return;
+  var wrap=document.createElement('div');
+  wrap.innerHTML='<label class="fl">Pakai template TOS</label><select id="f-tos-tpl"><option value="">— pilih template untuk mengisi otomatis —</option>'+tosTplX.map(function(t,i){ return '<option value="'+i+'">'+esc(t.name)+'</option>'; }).join('')+'</select>';
+  var lbl=ta.previousElementSibling;
+  if(lbl&&lbl.tagName==='LABEL') lbl.parentElement.insertBefore(wrap,lbl); else ta.parentElement.insertBefore(wrap,ta);
+  $('f-tos-tpl').onchange=function(){ var v=this.value; if(v==='')return; var t=tosTplX[Number(v)]; if(t){ ta.value=t.text; showToast('Template dimuat — masih bisa diedit sebelum disimpan'); } this.value=''; };
+}
+
 // ---------- BOOT ----------
-function bootX(){ try{ addNavX(); hookProductsX(); hookBroadcastX(); }catch(e){} }
+function bootX(){ try{ addNavX(); hookProductsX(); hookBroadcastX(); hookSettingsX(); hookProdFormX(); }catch(e){} }
 document.addEventListener('DOMContentLoaded',bootX);
 new MutationObserver(bootX).observe(document.documentElement,{childList:true,subtree:true});
 })();
