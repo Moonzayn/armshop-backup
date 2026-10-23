@@ -1,0 +1,294 @@
+const express = require('express');
+const crypto = require('crypto');
+const store = require('./db');
+
+const sessions = new Set();
+const app = express();
+app.use(express.json({ limit: '2mb' }));
+
+const auth = (req, res, next) => {
+  const t = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith('sess='));
+  if (t && sessions.has(t.slice(5))) return next();
+  if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'unauthorized' });
+  return res.redirect('/login');
+};
+
+app.get('/login', (req, res) => res.send(LOGIN_HTML));
+app.post('/api/login', (req, res) => {
+  if (req.body.password === process.env.ADMIN_PASSWORD) {
+    const t = crypto.randomBytes(24).toString('hex');
+    sessions.add(t);
+    res.setHeader('Set-Cookie', `sess=${t}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400`);
+    return res.json({ ok: true });
+  }
+  res.status(401).json({ error: 'Password salah' });
+});
+app.post('/api/logout', (req, res) => {
+  const t = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith('sess='));
+  if (t) sessions.delete(t.slice(5));
+  res.json({ ok: true });
+});
+
+app.use(auth);
+app.get('/', (req, res) => res.send(APP_HTML));
+
+// ---- API ----
+app.get('/api/stats', (req, res) => {
+  const s = store.orderStats();
+  s.low_stock = store.lowStock(Number(store.getSetting('low_stock_threshold', '3')) || 3);
+  res.json(s);
+});
+app.get('/api/orders', (req, res) => {
+  const st = req.query.status;
+  res.json(st && st !== 'all' ? store.ordersByStatus(st) : store.recentOrders(100));
+});
+app.get('/api/order/:id', (req, res) => {
+  const o = store.getOrder(req.params.id);
+  if (!o) return res.status(404).json({ error: 'not found' });
+  o.items = store.db.prepare('SELECT * FROM order_items WHERE order_id=?').all(o.order_id);
+  res.json(o);
+});
+app.post('/api/order/:id/deliver', (req, res) => {
+  const o = store.getOrder(req.params.id);
+  if (!o) return res.status(404).json({ error: 'not found' });
+  store.setOrderStatus(o.order_id, 'paid', { delivered_content: req.body.content || '' });
+  res.json({ ok: true });
+});
+app.get('/api/products', (req, res) => res.json(store.allProducts()));
+app.post('/api/products', (req, res) => {
+  const b = req.body;
+  const id = b.id || ('PRD-' + crypto.randomBytes(4).toString('hex').toUpperCase());
+  store.db.prepare(`INSERT INTO products(id,category_id,name,description,price,type,photo_url,is_active,sort)
+    VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET category_id=excluded.category_id,name=excluded.name,description=excluded.description,price=excluded.price,type=excluded.type,photo_url=excluded.photo_url,is_active=excluded.is_active,sort=excluded.sort`)
+    .run(id, b.category_id || '', b.name, b.description || '', Number(b.price) || 0, b.type || 'digital', b.photo_url || '', b.is_active ? 1 : 0, Number(b.sort) || 0);
+  res.json({ ok: true, id });
+});
+app.delete('/api/products/:id', (req, res) => {
+  store.db.prepare('UPDATE products SET is_active=0 WHERE id=?').run(req.params.id);
+  res.json({ ok: true });
+});
+app.get('/api/categories', (req, res) => res.json(store.categories()));
+app.post('/api/categories', (req, res) => {
+  const b = req.body;
+  const id = b.id || ('cat-' + crypto.randomBytes(3).toString('hex'));
+  store.db.prepare('INSERT INTO categories(id,name,sort) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,sort=excluded.sort').run(id, b.name, Number(b.sort) || 0);
+  res.json({ ok: true, id });
+});
+app.delete('/api/categories/:id', (req, res) => { store.db.prepare('DELETE FROM categories WHERE id=?').run(req.params.id); res.json({ ok: true }); });
+app.post('/api/stock', (req, res) => {
+  const lines = String(req.body.content || '').split('\n').map(s => s.trim()).filter(Boolean);
+  const ins = store.db.prepare('INSERT INTO stock(product_id,content) VALUES(?,?)');
+  const tx = store.db.transaction(ls => ls.forEach(l => ins.run(req.body.product_id, l)));
+  tx(lines);
+  res.json({ ok: true, added: lines.length });
+});
+app.get('/api/vouchers', (req, res) => res.json(store.db.prepare('SELECT * FROM vouchers ORDER BY id DESC').all()));
+app.post('/api/vouchers', (req, res) => {
+  const b = req.body;
+  store.db.prepare(`INSERT INTO vouchers(code,kind,value,min_amount,quota,is_active) VALUES(?,?,?,?,?,?)
+    ON CONFLICT(code) DO UPDATE SET kind=excluded.kind,value=excluded.value,min_amount=excluded.min_amount,quota=excluded.quota,is_active=excluded.is_active`)
+    .run(String(b.code).toUpperCase(), b.kind || 'percent', Number(b.value) || 0, Number(b.min_amount) || 0, Number(b.quota) || 0, b.is_active ? 1 : 0);
+  res.json({ ok: true });
+});
+app.delete('/api/vouchers/:code', (req, res) => { store.db.prepare('DELETE FROM vouchers WHERE code=?').run(req.params.code); res.json({ ok: true }); });
+app.get('/api/settings', (req, res) => {
+  res.json(Object.fromEntries(store.db.prepare('SELECT key,value FROM settings').all().map(r => [r.key, r.value])));
+});
+app.post('/api/settings', (req, res) => {
+  for (const [k, v] of Object.entries(req.body || {})) store.setSetting(k, v);
+  res.json({ ok: true });
+});
+app.post('/api/broadcast', async (req, res) => {
+  const users = store.db.prepare('SELECT id FROM users').all();
+  let sent = 0;
+  for (const u of users) {
+    try { await global._bot.telegram.sendMessage(u.id, req.body.text, { parse_mode: 'HTML' }); sent++; }
+    catch (e) {}
+    await new Promise(r => setTimeout(r, 60));
+  }
+  res.json({ ok: true, sent, total: users.length });
+});
+
+const PORT = Number(process.env.WEB_PORT || 7101);
+function startWeb() { app.listen(PORT, '0.0.0.0', () => console.log(`[web] admin :${PORT}`)); }
+module.exports = { startWeb };
+
+// ==================== HTML ====================
+const LOGIN_HTML = `<!DOCTYPE html><html lang="id"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login — Admin</title><style>
+*{box-sizing:border-box;margin:0;font-family:'Segoe UI',system-ui,sans-serif}
+body{background:#0b0f1a;color:#e5e9f0;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:#131a2a;border:1px solid #1f2a44;border-radius:16px;padding:36px;width:340px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+h1{font-size:20px;margin-bottom:6px}.sub{color:#8b94ad;font-size:13px;margin-bottom:22px}
+input{width:100%;background:#0b0f1a;border:1px solid #2a3550;border-radius:10px;color:#fff;padding:12px 14px;font-size:15px;margin-bottom:14px;outline:none}
+input:focus{border-color:#6366f1}
+button{width:100%;background:linear-gradient(135deg,#6366f1,#8b5cf6);border:0;border-radius:10px;color:#fff;padding:12px;font-size:15px;font-weight:600;cursor:pointer}
+.err{color:#f87171;font-size:13px;margin-bottom:10px;min-height:18px}
+.logo{font-size:34px;margin-bottom:12px}
+</style></head><body><div class="card">
+<div class="logo">🛍️</div><h1>Admin Panel</h1><div class="sub">La Cukai Shop</div>
+<div class="err" id="err"></div>
+<input type="password" id="pw" placeholder="Password admin" autofocus>
+<button onclick="login()">Masuk</button>
+<script>
+async function login(){const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})});
+if(r.ok)location.href='/';else document.getElementById('err').textContent='❌ Password salah';}
+document.getElementById('pw').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
+</script></div></body></html>`;
+
+const APP_HTML = `<!DOCTYPE html><html lang="id"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin — La Cukai Shop</title><style>
+*{box-sizing:border-box;margin:0;font-family:'Segoe UI',system-ui,sans-serif}
+:root{--bg:#0b0f1a;--card:#131a2a;--line:#1f2a44;--txt:#e5e9f0;--mut:#8b94ad;--acc:#6366f1;--acc2:#8b5cf6;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444}
+body{background:var(--bg);color:var(--txt);display:flex;min-height:100vh}
+aside{width:230px;background:#0d1322;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;height:100vh;flex-shrink:0}
+.logo{font-size:18px;font-weight:700;margin-bottom:26px;padding:0 8px}.logo span{background:linear-gradient(135deg,var(--acc),var(--acc2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+nav button{display:flex;gap:10px;align-items:center;width:100%;background:none;border:0;color:var(--mut);padding:11px 12px;border-radius:10px;font-size:14px;cursor:pointer;margin-bottom:4px;text-align:left}
+nav button:hover{background:#16203a;color:var(--txt)}
+nav button.on{background:linear-gradient(135deg,rgba(99,102,241,.25),rgba(139,92,246,.25));color:#fff;border:1px solid rgba(99,102,241,.4)}
+main{flex:1;padding:28px;max-width:1100px}
+h2{font-size:22px;margin-bottom:4px}.page-sub{color:var(--mut);font-size:13px;margin-bottom:20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:22px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+.stat .l{color:var(--mut);font-size:12px;margin-bottom:6px}.stat .v{font-size:24px;font-weight:700}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:18px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--mut);font-weight:500;padding:10px;border-bottom:1px solid var(--line)}
+td{padding:10px;border-bottom:1px solid #16203a;vertical-align:top}
+.badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600}
+.b-pending{background:rgba(245,158,11,.15);color:var(--warn)}.b-paid{background:rgba(34,197,94,.15);color:var(--ok)}
+.b-expired,.b-cancelled{background:rgba(239,68,68,.12);color:var(--err)}
+.btn{background:linear-gradient(135deg,var(--acc),var(--acc2));border:0;color:#fff;padding:9px 16px;border-radius:9px;font-size:13px;font-weight:600;cursor:pointer}
+.btn.ghost{background:#1a2340;border:1px solid var(--line)}
+.btn.danger{background:rgba(239,68,68,.15);color:var(--err);border:1px solid rgba(239,68,68,.3)}
+.btn.sm{padding:5px 10px;font-size:12px}
+input,select,textarea{background:#0b0f1a;border:1px solid #2a3550;border-radius:9px;color:#fff;padding:10px 12px;font-size:13px;width:100%;outline:none;margin-bottom:10px}
+input:focus,select:focus,textarea:focus{border-color:var(--acc)}
+label{font-size:12px;color:var(--mut);display:block;margin-bottom:5px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:50}
+.modal.open{display:flex}.mbox{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;width:480px;max-width:94vw;max-height:90vh;overflow:auto}
+.mbox h3{margin-bottom:16px}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.tabs{display:flex;gap:8px;margin-bottom:16px}
+.tabs button{background:#16203a;border:1px solid var(--line);color:var(--mut);padding:8px 14px;border-radius:9px;font-size:13px;cursor:pointer}
+.tabs button.on{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border:0}
+.prod-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}
+.prod{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.prod img{width:100%;height:130px;object-fit:cover;background:#1a2340}
+.prod .pb{padding:14px}.prod .pn{font-weight:600;font-size:14px;margin-bottom:4px}.prod .pp{color:var(--acc2);font-weight:700;margin:6px 0}
+code{background:#0b0f1a;padding:2px 8px;border-radius:6px;font-size:12px}
+.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
+.alert{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);border-radius:12px;padding:12px 16px;font-size:13px;margin-bottom:16px}
+.page{display:none}.page.on{display:block}
+pre{white-space:pre-wrap;font-size:12px;background:#0b0f1a;padding:12px;border-radius:9px;max-height:200px;overflow:auto}
+</style></head><body>
+<aside><div class="logo">🛍️ <span>La Cukai</span> Admin</div><nav id="nav"></nav>
+<div style="margin-top:30px"><button class="btn ghost" style="width:100%" onclick="logout()">🚪 Keluar</button></div></aside>
+<main>
+<div class="topbar"><div><h2 id="ptitle">Dashboard</h2><div class="page-sub" id="psub"></div></div></div>
+<div id="alerts"></div>
+<section class="page on" id="p-dash"></section>
+<section class="page" id="p-orders"></section>
+<section class="page" id="p-products"></section>
+<section class="page" id="p-stock"></section>
+<section class="page" id="p-voucher"></section>
+<section class="page" id="p-broadcast"></section>
+<section class="page" id="p-settings"></section>
+</main>
+<div class="modal" id="modal"><div class="mbox" id="mbox"></div></div>
+<script>
+const rp=n=>'Rp'+Number(n||0).toLocaleString('id-ID');
+const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+const stBadge=s=>'<span class="badge b-'+s+'">'+({pending:'⏳ Pending',paid:'✅ Lunas',expired:'⌛ Kadaluarsa',cancelled:'❌ Batal'})[s]+'</span>';
+const PAGES=[['dash','📊','Dashboard','Ringkasan toko hari ini'],['orders','🧾','Pesanan','Kelola semua order'],['products','📦','Produk','Katalog & harga'],['stock','🔑','Stok Digital','Kode akun / lisensi'],['voucher','🎟️','Voucher','Kode diskon'],['broadcast','📣','Broadcast','Kirim pesan ke semua user'],['settings','⚙️','Pengaturan','Konfigurasi toko']];
+let cur='dash';
+document.getElementById('nav').innerHTML=PAGES.map(([k,i,t])=>'<button data-k="'+k+'" onclick="go(\\''+k+'\\')">'+i+' '+t+'</button>').join('');
+function go(k){cur=k;document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('on',b.dataset.k===k));
+document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));document.getElementById('p-'+k).classList.add('on');
+const m=PAGES.find(p=>p[0]===k);document.getElementById('ptitle').textContent=m[2];document.getElementById('psub').textContent=m[3];load(k);}
+async function api(m,u,b){const r=await fetch(u,{method:m,headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined});if(r.status===401){location.href='/login';return{}}return r.json();}
+function openModal(h){document.getElementById('mbox').innerHTML=h;document.getElementById('modal').classList.add('open');}
+function closeModal(){document.getElementById('modal').classList.remove('open');}
+document.getElementById('modal').addEventListener('click',e=>{if(e.target.id==='modal')closeModal();});
+async function logout(){await api('POST','/api/logout');location.href='/login';}
+
+async function load(k){({dash:loadDash,orders:loadOrders,products:loadProducts,stock:loadStock,voucher:loadVoucher,broadcast:loadBC,settings:loadSettings})[k]();}
+async function loadDash(){
+ const s=await api('GET','/api/stats');const o=await api('GET','/api/orders?status=all');
+ document.getElementById('alerts').innerHTML=(s.low_stock||[]).map(p=>'<div class="alert">⚠️ Stok menipis: <b>'+esc(p.name)+'</b> (sisa '+p.n+')</div>').join('');
+ document.getElementById('p-dash').innerHTML=
+ '<div class="grid">'+
+ '<div class="stat"><div class="l">💰 Omzet Hari Ini</div><div class="v">'+rp(s.today_revenue)+'</div></div>'+
+ '<div class="stat"><div class="l">🧾 Order Hari Ini</div><div class="v">'+s.today_orders+'</div></div>'+
+ '<div class="stat"><div class="l">⏳ Pending</div><div class="v">'+s.pending+'</div></div>'+
+ '<div class="stat"><div class="l">📈 Omzet Bulan Ini</div><div class="v">'+rp(s.month_revenue)+'</div></div></div>'+
+ '<div class="card"><h3 style="margin-bottom:12px">🕐 Order Terbaru</h3><table><tr><th>Order</th><th>Produk</th><th>Total</th><th>Status</th><th></th></tr>'+
+ o.slice(0,10).map(x=>'<tr><td><code>'+x.order_id+'</code></td><td>'+esc(x.product_name)+'</td><td>'+rp(x.total)+'</td><td>'+stBadge(x.status)+'</td><td><button class="btn sm ghost" onclick="orderDetail(\\''+x.order_id+'\\')">Detail</button></td></tr>').join('')+'</table></div>';
+}
+let orderFilter='all';
+async function loadOrders(){
+ const list=await api('GET','/api/orders?status='+orderFilter);
+ document.getElementById('p-orders').innerHTML='<div class="tabs">'+['all','pending','paid','expired','cancelled'].map(s=>'<button class="'+(orderFilter===s?'on':'')+'" onclick="orderFilter=\\''+s+'\\';loadOrders()">'+s+'</button>').join('')+'</div>'+
+ '<div class="card"><table><tr><th>Order</th><th>User</th><th>Produk</th><th>Total</th><th>Status</th><th>Tanggal</th><th></th></tr>'+
+ list.map(x=>'<tr><td><code>'+x.order_id+'</code></td><td>'+x.user_id+'</td><td>'+esc(x.product_name)+'</td><td>'+rp(x.total)+'</td><td>'+stBadge(x.status)+'</td><td>'+new Date(x.created_at).toLocaleString('id-ID')+'</td><td><button class="btn sm ghost" onclick="orderDetail(\\''+x.order_id+'\\')">Detail</button></td></tr>').join('')+'</table></div>';
+}
+async function orderDetail(id){
+ const o=await api('GET','/api/order/'+id);
+ openModal('<h3>🧾 '+o.order_id+'</h3>'+stBadge(o.status)+'<br><br>'+
+ '<table><tr><td>User</td><td>'+o.user_id+'</td></tr><tr><td>Produk</td><td>'+esc(o.product_name)+'</td></tr><tr><td>Total</td><td><b>'+rp(o.total)+'</b></td></tr><tr><td>Voucher</td><td>'+esc(o.voucher_code||'-')+'</td></tr><tr><td>Dibuat</td><td>'+new Date(o.created_at).toLocaleString('id-ID')+'</td></tr>'+(o.paid_at?'<tr><td>Bayar</td><td>'+new Date(o.paid_at).toLocaleString('id-ID')+'</td></tr>':'')+'</table>'+
+ (o.delivered_content?'<label>Konten terkirim:</label><pre>'+esc(o.delivered_content)+'</pre>':'')+
+ '<label>Kirim manual / update konten:</label><textarea id="dcontent" rows="4" placeholder="Kode produk / instruksi manual…"></textarea>'+
+ '<div class="row2"><button class="btn" onclick="deliverOrder(\\''+o.order_id+'\\')">✅ Tandai Lunas & Kirim</button><button class="btn ghost" onclick="closeModal()">Tutup</button></div>');
+}
+async function deliverOrder(id){const c=document.getElementById('dcontent').value;await api('POST','/api/order/'+id+'/deliver',{content:c});closeModal();loadOrders();}
+let prodCache=[];
+async function loadProducts(){
+ prodCache=await api('GET','/api/products');const cats=await api('GET','/api/categories');
+ document.getElementById('p-products').innerHTML='<button class="btn" style="margin-bottom:14px" onclick="prodForm()">➕ Tambah Produk</button> <button class="btn ghost" style="margin-bottom:14px" onclick="catForm()">📁 Kelola Kategori</button><div class="prod-grid">'+
+ prodCache.map(p=>'<div class="prod">'+(p.photo_url?'<img src="'+esc(p.photo_url)+'">':'')+'<div class="pb"><div class="pn">'+esc(p.name)+'</div><div style="font-size:12px;color:var(--mut)">'+esc(p.cat_name||'')+' · '+(p.type==='digital'?'🔑 Digital':'🛠️ Manual')+'</div><div class="pp">'+rp(p.price)+'</div><div style="font-size:12px;margin-bottom:10px">📦 Stok: <b>'+p.stock_n+'</b> '+(p.is_active?'':'· ⛔ nonaktif')+'</div><button class="btn sm ghost" onclick="prodForm(\\''+p.id+'\\')">✏️ Edit</button> <button class="btn sm danger" onclick="delProd(\\''+p.id+'\\')">Hapus</button></div></div>').join('')+'</div>';
+ window._cats=cats;
+}
+function prodForm(id){
+ const p=id?prodCache.find(x=>x.id===id):{};
+ openModal('<h3>'+(id?'✏️ Edit':'➕ Tambah')+' Produk</h3>'+
+ '<label>Nama</label><input id="f-name" value="'+esc(p.name||'')+'">'+
+ '<div class="row2"><div><label>Harga (Rp)</label><input id="f-price" type="number" value="'+(p.price||'')+'"></div><div><label>Tipe</label><select id="f-type"><option value="digital" '+(p.type!=='manual'?'selected':'')+'>🔑 Digital (stok kode)</option><option value="manual" '+(p.type==='manual'?'selected':'')+'>🛠️ Manual / layanan</option></select></div></div>'+
+ '<label>Kategori</label><select id="f-cat">'+window._cats.map(c=>'<option value="'+c.id+'" '+(p.category_id===c.id?'selected':'')+'>'+esc(c.name)+'</option>').join('')+'</select>'+
+ '<label>Foto (URL)</label><input id="f-photo" value="'+esc(p.photo_url||'')+'">'+
+ '<label>Deskripsi</label><textarea id="f-desc" rows="4">'+esc(p.description||'')+'</textarea>'+
+ '<div class="row2"><button class="btn" onclick="saveProd(\\''+(id||'')+'\\')">💾 Simpan</button><button class="btn ghost" onclick="closeModal()">Batal</button></div>');
+}
+async function saveProd(id){const b={name:document.getElementById('f-name').value,price:document.getElementById('f-price').value,type:document.getElementById('f-type').value,category_id:document.getElementById('f-cat').value,photo_url:document.getElementById('f-photo').value,description:document.getElementById('f-desc').value,is_active:1};if(id)b.id=id;await api('POST','/api/products',b);closeModal();loadProducts();}
+async function delProd(id){if(!confirm('Nonaktifkan produk ini?'))return;await api('DELETE','/api/products/'+id);loadProducts();}
+function catForm(){
+ openModal('<h3>📁 Kategori</h3>'+window._cats.map(c=>'<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)"><span>'+esc(c.name)+'</span><button class="btn sm danger" onclick="delCat(\\''+c.id+'\\')">Hapus</button></div>').join('')+'<br><label>Nama kategori baru</label><input id="c-name" placeholder="cth: 🎬 Streaming"><div class="row2"><button class="btn" onclick="saveCat()">➕ Tambah</button><button class="btn ghost" onclick="closeModal()">Tutup</button></div>');
+}
+async function saveCat(){const n=document.getElementById('c-name').value;if(!n)return;await api('POST','/api/categories',{name:n});closeModal();loadProducts();}
+async function delCat(id){if(!confirm('Hapus kategori? Produk di dalamnya jadi tanpa kategori.'))return;await api('DELETE','/api/categories/'+id);closeModal();loadProducts();}
+async function loadStock(){
+ const prods=prodCache.length?prodCache:await api('GET','/api/products');
+ document.getElementById('p-stock').innerHTML='<div class="card"><h3 style="margin-bottom:12px">➕ Tambah Stok (satu kode per baris)</h3><label>Produk</label><select id="s-prod">'+prods.filter(p=>p.type==='digital').map(p=>'<option value="'+p.id+'">'+esc(p.name)+' (stok: '+p.stock_n+')</option>').join('')+'</select><label>Kode stok</label><textarea id="s-content" rows="6" placeholder="akun1 | pass1&#10;akun2 | pass2"></textarea><button class="btn" onclick="addStock()">💾 Simpan Stok</button></div>';
+}
+async function addStock(){const r=await api('POST','/api/stock',{product_id:document.getElementById('s-prod').value,content:document.getElementById('s-content').value});alert('✅ '+r.added+' kode ditambahkan');loadStock();}
+async function loadVoucher(){
+ const v=await api('GET','/api/vouchers');
+ document.getElementById('p-voucher').innerHTML='<button class="btn" style="margin-bottom:14px" onclick="vForm()">➕ Tambah Voucher</button><div class="card"><table><tr><th>Kode</th><th>Diskon</th><th>Min. Belanja</th><th>Kuota</th><th>Terpakai</th><th></th></tr>'+
+ v.map(x=>'<tr><td><code>'+x.code+'</code></td><td>'+(x.kind==='percent'?x.value+'%':rp(x.value))+'</td><td>'+rp(x.min_amount)+'</td><td>'+(x.quota||'∞')+'</td><td>'+x.used+'</td><td><button class="btn sm danger" onclick="delV(\\''+x.code+'\\')">Hapus</button></td></tr>').join('')+'</table></div>';
+}
+function vForm(){openModal('<h3>➕ Voucher Baru</h3><label>Kode</label><input id="v-code" placeholder="HEMAT10"><div class="row2"><div><label>Jenis</label><select id="v-kind"><option value="percent">Persen (%)</option><option value="nominal">Nominal (Rp)</option></select></div><div><label>Nilai</label><input id="v-val" type="number"></div></div><div class="row2"><div><label>Min. belanja</label><input id="v-min" type="number" value="0"></div><div><label>Kuota (0 = unlimited)</label><input id="v-quota" type="number" value="0"></div></div><div class="row2"><button class="btn" onclick="saveV()">💾 Simpan</button><button class="btn ghost" onclick="closeModal()">Batal</button></div>');}
+async function saveV(){await api('POST','/api/vouchers',{code:document.getElementById('v-code').value,kind:document.getElementById('v-kind').value,value:document.getElementById('v-val').value,min_amount:document.getElementById('v-min').value,quota:document.getElementById('v-quota').value,is_active:1});closeModal();loadVoucher();}
+async function delV(c){if(!confirm('Hapus voucher '+c+'?'))return;await api('DELETE','/api/vouchers/'+encodeURIComponent(c));loadVoucher();}
+function loadBC(){document.getElementById('p-broadcast').innerHTML='<div class="card"><h3 style="margin-bottom:12px">📣 Broadcast</h3><label>Pesan (boleh pakai &lt;b&gt; HTML)</label><textarea id="b-text" rows="5" placeholder="Promo spesial hari ini…"></textarea><button class="btn" onclick="sendBC()">📤 Kirim ke Semua User</button></div>';}
+async function sendBC(){const t=document.getElementById('b-text').value;if(!t||!confirm('Kirim broadcast?'))return;const r=await api('POST','/api/broadcast',{text:t});alert('✅ Terkirim ke '+r.sent+'/'+r.total+' user');}
+async function loadSettings(){
+ const s=await api('GET','/api/settings');
+ document.getElementById('p-settings').innerHTML='<div class="card"><h3 style="margin-bottom:12px">⚙️ Pengaturan</h3>'+
+ '<label>Nama toko</label><input id="g-shop_name" value="'+esc(s.shop_name||'')+'">'+
+ '<label>Tagline</label><input id="g-shop_tagline" value="'+esc(s.shop_tagline||'')+'">'+
+ '<label>Kontak admin</label><input id="g-admin_contact" value="'+esc(s.admin_contact||'')+'">'+
+ '<div class="row2"><div><label>Masa berlaku QRIS (menit)</label><input id="g-invoice_expire_minutes" type="number" value="'+esc(s.invoice_expire_minutes||'60')+'"></div><div><label>Ambang stok menipis</label><input id="g-low_stock_threshold" type="number" value="'+esc(s.low_stock_threshold||'3')+'"></div></div>'+
+ '<button class="btn" onclick="saveSettings()">💾 Simpan</button></div>';
+}
+async function saveSettings(){const b={};document.querySelectorAll('#p-settings input').forEach(i=>b[i.id.replace('g-','')]=i.value);await api('POST','/api/settings',b);alert('✅ Tersimpan');}
+go('dash');
+</script></body></html>`;
