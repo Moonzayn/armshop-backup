@@ -30,6 +30,7 @@ ls "$REPO/db"/shop-*.sqlite.gz | sort | head -n -14 | xargs -r rm -f
 mkdir -p "$REPO/infra/scripts"
 cp /etc/nginx/sites-enabled/* "$REPO/infra/" 2>/dev/null || true
 systemctl cat armshop-backup-db.service armshop-backup-db.timer armshop-backup-sync.service armshop-backup-sync.timer armshop-backup-full.service armshop-backup-full.timer > "$REPO/infra/systemd-backup-units.txt" 2>/dev/null || true
+cp /etc/systemd/system/lacukai-watchdog.service /etc/systemd/system/lacukai-watchdog.timer "$REPO/infra/" 2>/dev/null || true
 cp /home/ubuntu/armshop-backup/*.sh /home/ubuntu/armshop-backup/*.js "$REPO/infra/scripts/" 2>/dev/null || true
 cp /home/ubuntu/.pm2/dump.pm2 "$REPO/infra/" 2>/dev/null || true
 

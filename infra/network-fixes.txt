@@ -1,0 +1,14 @@
+# Perbaikan jaringan server AWS (lacukai-bot)
+# Tanggal: 25 Okt 2026
+#
+# Masalah: koneksi Node.js (undici/Telegraf) ke api.telegram.org ETIMEDOUT,
+# diduga rute IPv6 server rusak. curl lolos karena fallback ke IPv4.
+# Gejala: proses PM2 lacukai-bot "online" tapi bot tidak membaca/membalas
+# Telegram (6 pesan tertunda, 24 Okt 21:41 WIB s.d. 25 Okt 00:09 WIB).
+#
+# Perbaikan darurat (reversibel):
+#   149.154.166.110 api.telegram.org   (di /etc/hosts server AWS)
+# + restart lacukai-bot -> antrean tertunda 6 -> 0, polling jalan lagi.
+#
+# Catatan: pin IP ini darurat. Kalau Telegram mengubah IP api.telegram.org,
+# hapus baris itu dari /etc/hosts dan cek ulang koneksi IPv6 server.
