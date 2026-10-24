@@ -1,0 +1,10 @@
+[Unit]
+Description=Lacukai Bot Watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/lacukai-bot
+ExecStart=/usr/bin/python3 /home/ubuntu/lacukai-bot/lacukai_watchdog.py

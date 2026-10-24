@@ -1,0 +1,10 @@
+[Unit]
+Description=Cek lacukai-bot tiap 5 menit
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=lacukai-watchdog.service
+
+[Install]
+WantedBy=timers.target
