@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Watchdog lacukai-bot: cek antrean update Telegram yang belum dibaca bot.
+"""Watchdog lacukai-bot (v2, aman untuk polling).
 
-Cara kerja: getUpdates TANPA offset (read-only, tidak menghapus antrean).
-- Tidak ada antrean / antrean termuda < 15 menit -> sehat, diam.
-- Antrean tertua > 15 menit -> bot macet -> DM admin via curl (jalur curl
-  terbukti lolos saat node fetch bermasalah) + catat state agar tidak spam.
-- Antrean masih macet -> ulang alert tiap 60 menit.
+v1 memakai getUpdates dan itu SALAH: setiap panggilan getUpdates akan
+memutus long-poll bot dengan error 409, jadi alat cek justru merusak bot.
+v2 memakai getWebhookInfo (bukan getUpdates) yang hanya membaca status
+antrean tanpa mengganggu polling sama sekali.
+
+Logika:
+- pending_update_count == 0 -> sehat, reset hitungan.
+- pending > 0 tiga cek berturut-turut (3 x 5 menit = 15 menit) -> macet -> DM admin.
+- Selama masih macet, alert diulang tiap 60 menit.
 - Proses PM2 tidak online -> alert juga.
 Jalankan via systemd timer tiap 5 menit.
 """
-import json, os, subprocess, sys, time
+import json, os, subprocess, time
 
 BOT_DIR = os.path.expanduser("~/lacukai-bot")
 STATE_FILE = os.path.join(BOT_DIR, "watchdog_state.json")
 ADMIN_ID = "8815867386"
-STUCK_AFTER = 15 * 60      # detik
+STUCK_CHECKS = 3           # 3 cek x 5 menit = 15 menit
 REPEAT_EVERY = 60 * 60      # detik
 
 def read_token():
@@ -49,7 +53,6 @@ def send_alert(text):
     return bool(r.get("ok"))
 
 def main():
-    # 1) proses PM2 hidup?
     pm = subprocess.run(["pm2", "jlist"], capture_output=True, text=True).stdout
     alive = False
     try:
@@ -68,36 +71,54 @@ def main():
         print("ALERT: proses mati")
         return
 
-    # 2) antrean update
-    d = api("getUpdates", limit=10)
+    # 0b) disk & web admin lokal (tidak menyentuh Telegram sama sekali)
+    import shutil
+    try:
+        du = shutil.disk_usage("/")
+        used_pct = 100 * (du.total - du.free) / du.total
+        if used_pct >= 85 and now - state.get("disk_last_alert", 0) >= REPEAT_EVERY:
+            send_alert("\U0001f6a8 <b>Disk server menipis</b>\nTerpakai %.0f%% — segera bersih-bersih sebelum bot/database gagal." % used_pct)
+            state["disk_last_alert"] = now
+            save_state(state)
+    except Exception:
+        pass
+    try:
+        code = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                               "--max-time", "10", "http://127.0.0.1:7101/"],
+                              capture_output=True, text=True).stdout.strip()
+        if code not in ("200", "302") and now - state.get("web_last_alert", 0) >= REPEAT_EVERY:
+            send_alert("\U0001f6a8 <b>Web admin lacukai tidak menjawab</b>\nPort 7101: %s. Bot Telegram mungkin masih jalan, tapi admin web down." % (code or "?"))
+            state["web_last_alert"] = now
+            save_state(state)
+    except Exception:
+        pass
+
+    d = api("getWebhookInfo")
     if not d.get("ok"):
-        print("getUpdates gagal:", d)
+        print("getWebhookInfo gagal:", d)
         return
-    ups = d.get("result", [])
-    if not ups:
-        if state.get("stuck"):
+    pending = d["result"].get("pending_update_count", 0)
+    if pending == 0:
+        if state.get("stuck_count"):
+            state["stuck_count"] = 0
             state["stuck"] = False
             save_state(state)
         print("OK: antrean kosong")
         return
-    oldest = min(u["message"]["date"] if "message" in u else
-                 u.get("channel_post", {}).get("date", now) for u in ups)
-    age_min = (now - oldest) // 60
-    if now - oldest <= STUCK_AFTER:
-        print("OK: antrean %d, tertua %d menit" % (len(ups), age_min))
-        return
-    # macet
-    if (not state.get("stuck")) or (now - state.get("last_alert", 0) >= REPEAT_EVERY):
+    count = state.get("stuck_count", 0) + 1
+    state["stuck_count"] = count
+    if count >= STUCK_CHECKS and ((not state.get("stuck")) or
+                                  (now - state.get("last_alert", 0) >= REPEAT_EVERY)):
         ok = send_alert(
             "\U0001f6a8 <b>Lacukai Bot MACET</b>\n"
-            "Bot tidak membaca pesan selama <b>%d menit</b> (%d pesan tertunda).\n"
-            "Segera cek server / restart lacukai-bot." % (age_min, len(ups)))
+            "Bot tidak membaca pesan selama <b>~%d menit</b> (%d pesan tertunda).\n"
+            "Segera cek server / restart lacukai-bot." % (count * 5, pending))
         state["stuck"] = True
         state["last_alert"] = now
-        save_state(state)
-        print("ALERT terkirim:", ok, "| antrean", len(ups), "| tertua", age_min, "menit")
+        print("ALERT terkirim:", ok, "| pending", pending, "| cek ke-", count)
     else:
-        print("masih macet, alert berikutnya nanti (antrean %d, tertua %d menit)" % (len(ups), age_min))
+        print("antrean %d, cek ke-%d (belum alert)" % (pending, count))
+    save_state(state)
 
 if __name__ == "__main__":
     main()
