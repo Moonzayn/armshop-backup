@@ -293,6 +293,32 @@ export default function CheckoutPage() {
                 </div>
               </dl>
 
+              {/* product terms (TOS) */}
+              {(() => {
+                const seen = new Set<string>();
+                const tosLines = lines.filter((l) => {
+                  const p = PRODUCTS.find((x) => x.id === l.productId);
+                  if (!p?.tosText || seen.has(p.id)) return false;
+                  seen.add(p.id);
+                  return true;
+                });
+                if (!tosLines.length) return null;
+                return (
+                  <div className="mt-5 space-y-3">
+                    {tosLines.map((l) => {
+                      const p = PRODUCTS.find((x) => x.id === l.productId)!;
+                      return (
+                        <div key={l.key} className="rounded-2xl border border-amber-300/40 bg-amber-400/[0.07] p-3.5">
+                          <p className="text-xs font-bold text-ink-950">📜 {t("Ketentuan produk")} — {p.name}</p>
+                          <div className="mt-2 max-h-44 overflow-y-auto whitespace-pre-line pr-1 text-[11.5px] leading-relaxed text-ink-500">{p.tosText}</div>
+                          <p className="mt-2 text-[11px] text-ink-400">{t("Dengan melanjutkan pembayaran, kamu menyetujui ketentuan di atas.")}</p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+
               {/* promo */}
               {promo ? (
                 <div className="mt-4 flex items-center justify-between gap-2 rounded-xl bg-emerald-400/10 px-3 py-2 text-sm ring-1 ring-emerald-300/30">

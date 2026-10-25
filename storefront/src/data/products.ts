@@ -75,6 +75,7 @@ export interface Product {
   tags: string[];
   art: { monogram: string; gradient?: [string, string] };
   addedAt: number; // higher = newer
+  tosText?: string;
 }
 
 export let PRODUCTS: Product[] = [];
@@ -97,6 +98,7 @@ interface ApiProduct {
   faqs: Faq[];
   tags: string[];
   createdAt: string | null;
+  tosText?: string;
 }
 
 function stripEmoji(s: string): string {
@@ -155,6 +157,7 @@ export async function loadCatalog(): Promise<void> {
       description: p.description,
       price: p.price,
       compareAt: p.originalPrice ?? undefined,
+      tosText: p.tosText || undefined,
       rating: 0,
       reviewCount: 0,
       sold: p.sold ?? 0,

@@ -185,6 +185,8 @@ const EN: Record<string, string> = {
   "Klik tombol di atas, atau buka @lacukbot langsung dari aplikasi Telegram.": "Tap the button above, or open @lacukbot directly from the Telegram app.",
   "Kode promo": "Promo code",
   "Punya kode promo?": "Have a promo code?",
+  "Ketentuan produk": "Product terms",
+  "Dengan melanjutkan pembayaran, kamu menyetujui ketentuan di atas.": "By proceeding with payment, you agree to the terms above.",
   "Kode promo dipakai saat checkout di bot Telegram @lacukbot.": "Promo codes are applied at checkout in the Telegram bot @lacukbot.",
   "Koleksi terfokus sesuai kebutuhanmu — temukan yang kamu cari dalam hitungan detik.": "A focused collection for what you need — find what you're looking for in seconds.",
   "Kompatibilitas:": "Compatibility:",
